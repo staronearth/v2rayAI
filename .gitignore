@@ -8,15 +8,41 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+dist/
 dist-ssr
 *.local
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+src-tauri/.cargo/config.toml
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts
+build/
+out/
+coverage/
+
+# App/runtime data
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
