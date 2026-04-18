@@ -3,6 +3,7 @@ name = "v2rayai"
 version = "0.1.0"
 description = "AI-powered v2ray/xray proxy configuration tool"
 authors = ["gaolin"]
+license = "MIT"
 edition = "2021"
 
 [lib]
