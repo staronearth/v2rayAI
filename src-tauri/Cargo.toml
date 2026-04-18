@@ -1,0 +1,36 @@
+[package]
+name = "v2rayai"
+version = "0.1.0"
+description = "AI-powered v2ray/xray proxy configuration tool"
+authors = ["gaolin"]
+edition = "2021"
+
+[lib]
+name = "v2rayai_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+base64 = "0.22"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+zip = { version = "2", features = ["deflate"] }
+regex = "1.12.3"
+urlencoding = "2"
+flate2 = "1"
+tar = "0.4"
