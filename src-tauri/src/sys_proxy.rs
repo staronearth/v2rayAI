@@ -76,64 +76,109 @@ async fn get_active_interfaces() -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 async fn enable_macos_proxy(settings: &ProxySettings) -> Result<String, String> {
-    use tokio::process::Command;
-
     let interfaces = get_active_interfaces().await;
     if interfaces.is_empty() {
         return Err("未找到可用网络接口".to_string());
     }
 
     let mut set_count = 0;
+    let mut failures = Vec::new();
     for iface in &interfaces {
-        // HTTP proxy
-        Command::new("networksetup")
-            .args(["-setwebproxy", iface, &settings.http_host, &settings.http_port.to_string()])
-            .output().await.ok();
-        Command::new("networksetup")
-            .args(["-setwebproxystate", iface, "on"])
-            .output().await.ok();
+        let http_port = settings.http_port.to_string();
+        let socks_port = settings.socks_port.to_string();
+        let commands = [
+            vec!["-setwebproxy", iface, &settings.http_host, &http_port],
+            vec!["-setwebproxystate", iface, "on"],
+            vec!["-setsecurewebproxy", iface, &settings.http_host, &http_port],
+            vec!["-setsecurewebproxystate", iface, "on"],
+            vec![
+                "-setsocksfirewallproxy",
+                iface,
+                &settings.socks_host,
+                &socks_port,
+            ],
+            vec!["-setsocksfirewallproxystate", iface, "on"],
+        ];
 
-        // HTTPS proxy
-        Command::new("networksetup")
-            .args(["-setsecurewebproxy", iface, &settings.http_host, &settings.http_port.to_string()])
-            .output().await.ok();
-        Command::new("networksetup")
-            .args(["-setsecurewebproxystate", iface, "on"])
-            .output().await.ok();
+        let mut iface_ok = true;
+        for args in commands {
+            if let Err(err) = run_networksetup(&args).await {
+                iface_ok = false;
+                failures.push(format!("{}: {}", iface, err));
+            }
+        }
 
-        // SOCKS5 proxy
-        Command::new("networksetup")
-            .args(["-setsocksfirewallproxy", iface, &settings.socks_host, &settings.socks_port.to_string()])
-            .output().await.ok();
-        Command::new("networksetup")
-            .args(["-setsocksfirewallproxystate", iface, "on"])
-            .output().await.ok();
-
-        set_count += 1;
+        if iface_ok {
+            set_count += 1;
+        }
     }
 
-    Ok(format!("已在 {} 个网络接口启用系统代理（HTTP:{}, SOCKS:{}）",
-        set_count, settings.http_port, settings.socks_port))
+    if set_count == 0 {
+        return Err(format!("系统代理设置失败：{}", failures.join("; ")));
+    }
+
+    if !failures.is_empty() {
+        log::warn!("部分网络接口代理设置失败：{}", failures.join("; "));
+    }
+
+    Ok(format!(
+        "已在 {} 个网络接口启用系统代理（HTTP:{}, SOCKS:{}）",
+        set_count, settings.http_port, settings.socks_port
+    ))
 }
 
 #[cfg(target_os = "macos")]
 async fn disable_macos_proxy() -> Result<String, String> {
-    use tokio::process::Command;
-
     let interfaces = get_active_interfaces().await;
+    let mut failures = Vec::new();
     for iface in &interfaces {
-        Command::new("networksetup")
-            .args(["-setwebproxystate", iface, "off"])
-            .output().await.ok();
-        Command::new("networksetup")
-            .args(["-setsecurewebproxystate", iface, "off"])
-            .output().await.ok();
-        Command::new("networksetup")
-            .args(["-setsocksfirewallproxystate", iface, "off"])
-            .output().await.ok();
+        let commands = [
+            vec!["-setwebproxystate", iface, "off"],
+            vec!["-setsecurewebproxystate", iface, "off"],
+            vec!["-setsocksfirewallproxystate", iface, "off"],
+        ];
+
+        for args in commands {
+            if let Err(err) = run_networksetup(&args).await {
+                failures.push(format!("{}: {}", iface, err));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(format!(
+            "关闭系统代理时部分命令失败：{}",
+            failures.join("; ")
+        ));
     }
 
     Ok(format!("已在 {} 个网络接口关闭系统代理", interfaces.len()))
+}
+
+#[cfg(target_os = "macos")]
+async fn run_networksetup(args: &[&str]) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let output = Command::new("networksetup")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("networksetup 执行失败：{}", e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("退出码 {}", output.status)
+    };
+    Err(format!("networksetup {} 失败：{}", args.join(" "), message))
 }
 
 // ─── Windows ────────────────────────────────────────────────────
@@ -142,10 +187,15 @@ async fn disable_macos_proxy() -> Result<String, String> {
 fn enable_windows_proxy(settings: &ProxySettings) -> Result<String, String> {
     use std::os::windows::ffi::OsStrExt;
 
-    let proxy_server = format!("http={}:{};https={}:{};socks={}:{}",
-        settings.http_host, settings.http_port,
-        settings.http_host, settings.http_port,
-        settings.socks_host, settings.socks_port);
+    let proxy_server = format!(
+        "http={}:{};https={}:{};socks={}:{}",
+        settings.http_host,
+        settings.http_port,
+        settings.http_host,
+        settings.http_port,
+        settings.socks_host,
+        settings.socks_port
+    );
 
     set_windows_proxy_registry(true, &proxy_server)
         .map(|_| format!("已启用 Windows 系统代理：{}", proxy_server))
@@ -167,13 +217,33 @@ fn set_windows_proxy_registry(enable: bool, proxy_server: &str) -> Result<(), St
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
     Command::new("reg")
-        .args(["add", key, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", enable_val, "/f"])
+        .args([
+            "add",
+            key,
+            "/v",
+            "ProxyEnable",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            enable_val,
+            "/f",
+        ])
         .output()
         .map_err(|e| e.to_string())?;
 
     if enable && !proxy_server.is_empty() {
         Command::new("reg")
-            .args(["add", key, "/v", "ProxyServer", "/t", "REG_SZ", "/d", proxy_server, "/f"])
+            .args([
+                "add",
+                key,
+                "/v",
+                "ProxyServer",
+                "/t",
+                "REG_SZ",
+                "/d",
+                proxy_server,
+                "/f",
+            ])
             .output()
             .map_err(|e| e.to_string())?;
     }
@@ -199,22 +269,49 @@ async fn enable_linux_proxy(settings: &ProxySettings) -> Result<String, String> 
 
     let _ = Command::new("gsettings")
         .args(["set", "org.gnome.system.proxy", "mode", "manual"])
-        .output().await;
+        .output()
+        .await;
     let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.http", "host", &settings.http_host])
-        .output().await;
+        .args([
+            "set",
+            "org.gnome.system.proxy.http",
+            "host",
+            &settings.http_host,
+        ])
+        .output()
+        .await;
     let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.http", "port", &settings.http_port.to_string()])
-        .output().await;
+        .args([
+            "set",
+            "org.gnome.system.proxy.http",
+            "port",
+            &settings.http_port.to_string(),
+        ])
+        .output()
+        .await;
     let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.socks", "host", &settings.socks_host])
-        .output().await;
+        .args([
+            "set",
+            "org.gnome.system.proxy.socks",
+            "host",
+            &settings.socks_host,
+        ])
+        .output()
+        .await;
     let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.socks", "port", &settings.socks_port.to_string()])
-        .output().await;
+        .args([
+            "set",
+            "org.gnome.system.proxy.socks",
+            "port",
+            &settings.socks_port.to_string(),
+        ])
+        .output()
+        .await;
 
-    Ok(format!("已启用 Linux GNOME 系统代理（HTTP:{}, SOCKS:{}）",
-        settings.http_port, settings.socks_port))
+    Ok(format!(
+        "已启用 Linux GNOME 系统代理（HTTP:{}, SOCKS:{}）",
+        settings.http_port, settings.socks_port
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -222,6 +319,7 @@ async fn disable_linux_proxy() -> Result<String, String> {
     use tokio::process::Command;
     let _ = Command::new("gsettings")
         .args(["set", "org.gnome.system.proxy", "mode", "none"])
-        .output().await;
+        .output()
+        .await;
     Ok("已关闭 Linux GNOME 系统代理".to_string())
 }

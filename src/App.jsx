@@ -89,23 +89,10 @@ function App() {
       // Zero-config: Auto-detect or install core if missing
       if (!finalSettings.corePath) {
         try {
-          // 1. Try to detect existing installation
-          const detectedPath = await invoke('auto_detect_core')
-          finalSettings.corePath = detectedPath
-        } catch (_) {
-          // 2. If not found, implicitly trigger fetch and install in background
-          invoke('fetch_latest_xray').then(async release => {
-            const dir = `${window.__TAURI_INTERNALS__?.metadata?.currentDir || '.'}/xray`
-            try {
-              const installedPath = await invoke('download_xray_core', {
-                downloadUrl: release.downloadUrl,
-                installDir: dir
-              })
-              setSettings(s => ({ ...s, corePath: installedPath }))
-            } catch (e) {
-              console.warn('Auto-install failed:', e)
-            }
-          }).catch(e => console.warn('Fetch release failed:', e))
+          const result = await invoke('resolve_core')
+          finalSettings.corePath = result.path
+        } catch (e) {
+          console.warn('Core auto-resolve failed:', e)
         }
       }
 

@@ -1,8 +1,7 @@
 import { useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 
-// Provider presets: baseUrl, default model, placeholder for API key
-// Updated April 2026 with latest models from each provider
+// Provider presets that use OpenAI-compatible chat/completions APIs.
 const PROVIDER_PRESETS = {
   openai: {
     baseUrl: 'https://api.openai.com/v1',
@@ -15,12 +14,6 @@ const PROVIDER_PRESETS = {
     model: 'deepseek-chat',
     keyPlaceholder: 'sk-...',
     models: ['deepseek-chat', 'deepseek-reasoner'],
-  },
-  anthropic: {
-    baseUrl: 'https://api.anthropic.com/v1',
-    model: 'claude-opus-4.6',
-    keyPlaceholder: 'sk-ant-...',
-    models: ['claude-opus-4.6', 'claude-sonnet-4.6', 'claude-haiku-4.5'],
   },
   ollama: {
     baseUrl: 'http://localhost:11434/v1',
@@ -117,20 +110,27 @@ export default function SettingsPage({ settings, setSettings }) {
 
   const handleDownload = async () => {
     if (!latestRelease) return
-    // Default install dir: same folder as existing path, or ~/xray
     const dir = settings.corePath
       ? settings.corePath.replace(/\/[^\/]+$/, '')
-      : `${window.__TAURI_INTERNALS__?.metadata?.currentDir || '.'}/xray`
+      : undefined
     setCoreLoading(`下载中...`)
     setCoreError('')
     try {
-      const path = await invoke('download_xray_core', {
-        downloadUrl: latestRelease.downloadUrl,
-        installDir: dir
-      })
+      let path
+      if (dir) {
+        path = await invoke('download_xray_core', {
+          downloadUrl: latestRelease.downloadUrl,
+          installDir: dir
+        })
+      } else {
+        const result = await invoke('resolve_core')
+        path = result.path
+        setResolveResult(result)
+      }
       updateSetting('corePath', path)
       setCoreVersion('')
-      await handleCheckVersion()
+      const v = await invoke('get_core_version', { corePath: path })
+      setCoreVersion(v)
     } catch (e) { setCoreError(String(e)) }
     setCoreLoading('')
   }
@@ -182,13 +182,12 @@ export default function SettingsPage({ settings, setSettings }) {
               <label className="settings-label">AI 服务提供商</label>
               <select
                 className="settings-select"
-                value={settings.aiProvider}
+                value={PROVIDER_PRESETS[settings.aiProvider] ? settings.aiProvider : 'custom'}
                 onChange={e => handleProviderChange(e.target.value)}
                 id="ai-provider-select"
               >
                 <option value="openai">OpenAI</option>
                 <option value="deepseek">DeepSeek</option>
-                <option value="anthropic">Anthropic (Claude)</option>
                 <option value="ollama">Ollama (本地)</option>
                 <option value="custom">自定义</option>
               </select>

@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tauri::AppHandle;
-use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::process::Stdio;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreStatus {
@@ -40,7 +41,12 @@ impl CoreManager {
     }
 
     /// Start the v2ray/xray core with the given config
-    pub async fn start(&self, core_path: &str, config_path: &str, app: Option<AppHandle>) -> Result<String, String> {
+    pub async fn start(
+        &self,
+        core_path: &str,
+        config_path: &str,
+        app: Option<AppHandle>,
+    ) -> Result<String, String> {
         if !Path::new(core_path).exists() {
             return Err(format!("内核文件不存在：{}", core_path));
         }
@@ -67,7 +73,9 @@ impl CoreManager {
                     crate::traffic_monitor::parse_and_emit_traffic(app_clone.as_ref(), &line);
                     let mut logs = logs.lock().await;
                     logs.push(line);
-                    if logs.len() > 500 { logs.drain(0..100); }
+                    if logs.len() > 500 {
+                        logs.drain(0..100);
+                    }
                 }
             });
         }
@@ -81,9 +89,26 @@ impl CoreManager {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let mut logs = logs.lock().await;
                     logs.push(format!("[ERR] {}", line));
-                    if logs.len() > 500 { logs.drain(0..100); }
+                    if logs.len() > 500 {
+                        logs.drain(0..100);
+                    }
                 }
             });
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("检查内核状态失败：{}", e))?
+        {
+            let logs = self.logs.lock().await;
+            let recent_logs = logs.iter().rev().take(20).cloned().collect::<Vec<_>>();
+            let detail = if recent_logs.is_empty() {
+                "未捕获到内核输出".to_string()
+            } else {
+                recent_logs.into_iter().rev().collect::<Vec<_>>().join("\n")
+            };
+            return Err(format!("内核启动后立即退出（{}）：\n{}", status, detail));
         }
 
         *self.child.lock().await = Some(child);
@@ -96,6 +121,10 @@ impl CoreManager {
     pub async fn stop(&self) -> Result<String, String> {
         let mut child = self.child.lock().await;
         if let Some(mut c) = child.take() {
+            if let Ok(Some(_)) = c.try_wait() {
+                *self.start_time.lock().await = None;
+                return Ok("内核已停止".to_string());
+            }
             c.kill().await.map_err(|e| format!("停止内核失败：{}", e))?;
             *self.start_time.lock().await = None;
             Ok("内核已停止".to_string())
@@ -106,21 +135,48 @@ impl CoreManager {
 
     /// Get current status
     pub async fn status(&self) -> CoreStatus {
-        let child = self.child.lock().await;
-        let running = child.is_some();
+        let mut child = self.child.lock().await;
+        let mut pid = child.as_ref().and_then(|c| c.id());
+        let running = if let Some(c) = child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(_)) => {
+                    *child = None;
+                    *self.start_time.lock().await = None;
+                    pid = None;
+                    false
+                }
+                Ok(None) => true,
+                Err(e) => {
+                    let mut logs = self.logs.lock().await;
+                    logs.push(format!("[ERR] 检查内核状态失败：{}", e));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         let core_type = self.core_type.lock().await.clone();
         let uptime_secs = if let Some(start_time) = *self.start_time.lock().await {
             Some(start_time.elapsed().as_secs())
         } else {
             None
         };
-        CoreStatus { running, core_type, pid: None, uptime_secs }
+        CoreStatus {
+            running,
+            core_type,
+            pid,
+            uptime_secs,
+        }
     }
 
     /// Get recent logs
     pub async fn get_logs(&self, count: usize) -> Vec<String> {
         let logs = self.logs.lock().await;
-        let start = if logs.len() > count { logs.len() - count } else { 0 };
+        let start = if logs.len() > count {
+            logs.len() - count
+        } else {
+            0
+        };
         logs[start..].to_vec()
     }
 
@@ -237,17 +293,20 @@ pub async fn download_xray(download_url: &str, install_dir: &str) -> Result<Stri
     let out_path = tokio::task::spawn_blocking(move || -> Result<String, String> {
         use std::io::Cursor;
 
-        let xray_binary = if cfg!(target_os = "windows") { "xray.exe" } else { "xray" };
+        let xray_binary = if cfg!(target_os = "windows") {
+            "xray.exe"
+        } else {
+            "xray"
+        };
         let cursor = Cursor::new(zip_bytes);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| format!("解压失败：{}", e))?;
+        let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("解压失败：{}", e))?;
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
             if file.name() == xray_binary {
                 let out_path = format!("{}/{}", install_dir, xray_binary);
-                let mut out_file = std::fs::File::create(&out_path)
-                    .map_err(|e| format!("创建文件失败：{}", e))?;
+                let mut out_file =
+                    std::fs::File::create(&out_path).map_err(|e| format!("创建文件失败：{}", e))?;
                 std::io::copy(&mut file, &mut out_file)
                     .map_err(|e| format!("写入文件失败：{}", e))?;
 
@@ -281,10 +340,17 @@ pub async fn find_xray_core() -> Result<String, String> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
 
-    let binary_name = if cfg!(target_os = "windows") { "xray.exe" } else { "xray" };
+    let binary_name = if cfg!(target_os = "windows") {
+        "xray.exe"
+    } else {
+        "xray"
+    };
 
     // --- 1. App private install directory (highest priority) ---
-    let private_path = Path::new(&home).join(".v2rayai").join("xray").join(binary_name);
+    let private_path = Path::new(&home)
+        .join(".v2rayai")
+        .join("xray")
+        .join(binary_name);
     if private_path.exists() {
         return Ok(private_path.to_string_lossy().to_string());
     }
@@ -292,8 +358,8 @@ pub async fn find_xray_core() -> Result<String, String> {
     // --- 2 & 3. Static candidate paths (macOS / Linux / Windows) ---
     #[cfg(target_os = "macos")]
     let candidates: &[&str] = &[
-        "/opt/homebrew/bin/xray",      // Homebrew ARM
-        "/usr/local/bin/xray",         // Homebrew Intel / manual
+        "/opt/homebrew/bin/xray", // Homebrew ARM
+        "/usr/local/bin/xray",    // Homebrew Intel / manual
         "/opt/homebrew/bin/v2ray",
         "/usr/local/bin/v2ray",
         "/usr/bin/xray",
@@ -402,7 +468,6 @@ pub async fn resolve_or_download_core() -> Result<CoreResolveResult, String> {
         description: format!("已自动下载 Xray {}", release.version),
     })
 }
-
 
 fn get_platform_asset_name() -> String {
     let os = if cfg!(target_os = "windows") {
