@@ -533,6 +533,14 @@ async fn apply_config(
 }
 
 #[tauri::command]
+async fn apply_raw_config(
+    config: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.config_manager.write_active_config(&config).await
+}
+
+#[tauri::command]
 async fn get_active_config_path(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.config_manager.active_config_path())
 }
@@ -853,6 +861,7 @@ pub fn run() {
             parse_subscription_content,
             generate_config,
             apply_config,
+            apply_raw_config,
             get_active_config_path,
             list_saved_configs,
             delete_saved_config,
@@ -1041,4 +1050,3 @@ mod tests {
         assert!(result.contains("结束文本"));
     }
 }
-

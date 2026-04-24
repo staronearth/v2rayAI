@@ -40,7 +40,12 @@ async function saveToStore(key, value) {
   try {
     const store = await getStore()
     if (!store) return
-    await store.set(key, value)
+    let valueToSave = value
+    if (key === 'settings') {
+      const { aiApiKey, ...safeSettings } = value
+      valueToSave = safeSettings
+    }
+    await store.set(key, valueToSave)
   } catch (e) {
     console.warn('Save failed:', e)
   }
@@ -52,7 +57,7 @@ const DEFAULT_SETTINGS = {
   aiProvider: 'openai',
   aiBaseUrl: 'https://api.openai.com/v1',
   aiApiKey: '',
-  aiModel: 'gpt-5.4',
+  aiModel: 'gpt-4o-mini',
   corePath: '',
   coreType: 'xray',
   httpPort: 10808,
@@ -84,22 +89,20 @@ function App() {
         loadFromStore('subscriptions', []),
       ])
       
-      let finalSettings = { ...DEFAULT_SETTINGS, ...savedSettings }
+      let finalSettings = { ...DEFAULT_SETTINGS, ...savedSettings, aiApiKey: '' }
       
-      // Zero-config: Auto-detect or install core if missing
-      if (!finalSettings.corePath) {
-        try {
-          const result = await invoke('resolve_core')
-          finalSettings.corePath = result.path
-        } catch (e) {
-          console.warn('Core auto-resolve failed:', e)
-        }
-      }
-
       setSettings(finalSettings)
       if (savedServers.length > 0) setServers(savedServers)
       if (savedSubs.length   > 0) setSubscriptions(savedSubs)
       setLoaded(true)
+
+      if (!finalSettings.corePath) {
+        invoke('resolve_core')
+          .then(result => {
+            setSettings(s => s.corePath ? s : { ...s, corePath: result.path })
+          })
+          .catch(e => console.warn('Core auto-resolve failed:', e))
+      }
     }
     init()
   }, [])
@@ -136,6 +139,24 @@ function App() {
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   const handleConnect = async (server) => {
+    const completed = {
+      core: false,
+      proxy: false,
+      health: false,
+    }
+
+    const rollbackConnect = async () => {
+      if (completed.health) {
+        try { await invoke('stop_health_monitor') } catch (e) { console.warn('Rollback health monitor failed:', e) }
+      }
+      if (completed.proxy) {
+        try { await invoke('disable_proxy') } catch (e) { console.warn('Rollback proxy failed:', e) }
+      }
+      if (completed.core) {
+        try { await invoke('stop_core') } catch (e) { console.warn('Rollback core failed:', e) }
+      }
+    }
+
     try {
       if (!settings.corePath) {
         setGlobalToast({ type: 'error', message: '请先在“设置”页面配置 Xray 内核路径！' })
@@ -146,17 +167,23 @@ function App() {
       setConnectionStatus('connecting')
       
       // 1. Generate and apply config
-      await invoke('apply_config', {
-        server: server.fullConfig || server,
-        httpPort: settings.httpPort,
-        socksPort: settings.socksPort,
-        routingMode: settings.routingMode
-      })
+      if (server.fullConfig) {
+        await invoke('apply_raw_config', { config: server.fullConfig })
+      } else {
+        await invoke('apply_config', {
+          server,
+          httpPort: settings.httpPort,
+          socksPort: settings.socksPort,
+          routingMode: settings.routingMode
+        })
+      }
       
       // 2. Start Xray Core
       await invoke('start_core', { corePath: settings.corePath })
+      completed.core = true
       
       // 3. Enable OS System Proxy
+      completed.proxy = true
       await invoke('enable_proxy', {
         httpPort: settings.httpPort,
         socksPort: settings.socksPort
@@ -164,10 +191,12 @@ function App() {
 
       // 4. Start Health Monitor
       await invoke('start_health_monitor', { httpProxyPort: settings.httpPort })
+      completed.health = true
 
       setActiveServer(server)
       setConnectionStatus('connected')
     } catch (e) {
+      await rollbackConnect()
       setGlobalToast({ type: 'error', message: `连接失败：${e}` })
       setTimeout(() => setGlobalToast(null), 5000)
       setConnectionStatus('disconnected')

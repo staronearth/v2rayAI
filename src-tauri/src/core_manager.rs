@@ -486,11 +486,7 @@ fn get_platform_asset_name() -> String {
         "64"
     };
 
-    if cfg!(target_os = "windows") {
-        format!("Xray-{}-{}.zip", os, arch)
-    } else if cfg!(target_os = "macos") {
-        format!("Xray-{}-{}.zip", os, arch)
-    } else {
-        format!("Xray-{}-{}.zip", os, arch)
-    }
+    // Xray release assets use the same `Xray-{os}-{arch}.zip` naming
+    // on all three platforms (see https://github.com/XTLS/Xray-core/releases).
+    format!("Xray-{}-{}.zip", os, arch)
 }

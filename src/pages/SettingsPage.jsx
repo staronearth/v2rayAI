@@ -5,9 +5,9 @@ import { invoke } from '@tauri-apps/api/core'
 const PROVIDER_PRESETS = {
   openai: {
     baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-5.4',
+    model: 'gpt-4o-mini',
     keyPlaceholder: 'sk-...',
-    models: ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5.4-pro'],
+    models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o3-mini'],
   },
   deepseek: {
     baseUrl: 'https://api.deepseek.com',
@@ -17,9 +17,9 @@ const PROVIDER_PRESETS = {
   },
   ollama: {
     baseUrl: 'http://localhost:11434/v1',
-    model: 'qwen3:7b',
+    model: 'qwen2.5:7b',
     keyPlaceholder: '(本地无需 Key，留空即可)',
-    models: ['qwen3:7b', 'qwen3:32b', 'llama4:8b', 'gemma4:12b', 'gemma3:4b', 'deepseek-r1:7b', 'phi4-mini'],
+    models: ['qwen2.5:7b', 'qwen2.5:14b', 'qwen2.5:32b', 'llama3.1:8b', 'llama3.2:3b', 'gemma2:9b', 'deepseek-r1:7b', 'phi3.5'],
   },
   custom: {
     baseUrl: '',
@@ -214,6 +214,9 @@ export default function SettingsPage({ settings, setSettings }) {
                 onChange={e => updateSetting('aiApiKey', e.target.value)}
                 id="ai-api-key-input"
               />
+              <div style={{ marginTop: 6, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                API Key 仅保留在当前会话。
+              </div>
             </div>
 
             <div className="settings-field">

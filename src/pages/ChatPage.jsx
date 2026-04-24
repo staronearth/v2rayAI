@@ -1,5 +1,38 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { lazy, Suspense, useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+const SyntaxHighlighter = lazy(async () => {
+  const [
+    highlighter,
+    theme,
+    json,
+    javascript,
+    bash,
+    markup,
+  ] = await Promise.all([
+    import('react-syntax-highlighter/dist/esm/prism-light'),
+    import('react-syntax-highlighter/dist/esm/styles/prism/vsc-dark-plus'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/json'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/javascript'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/bash'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/markup'),
+  ])
+  const Prism = highlighter.default
+  Prism.registerLanguage('json', json.default)
+  Prism.registerLanguage('javascript', javascript.default)
+  Prism.registerLanguage('js', javascript.default)
+  Prism.registerLanguage('bash', bash.default)
+  Prism.registerLanguage('shell', bash.default)
+  Prism.registerLanguage('html', markup.default)
+  Prism.registerLanguage('xml', markup.default)
+  return {
+    default: function LazySyntaxHighlighter(props) {
+      return <Prism {...props} style={theme.default} />
+    },
+  }
+})
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -473,81 +506,100 @@ function MessageBubble({ msg, onApplyConfig }) {
 }
 
 // ── Markdown Renderer ─────────────────────────────────────────────────────────
+// An "Apply config" button is injected for JSON code blocks that look like
+// a v2ray/xray config.
 
-function renderMarkdown(text, onApplyConfig, onCopy) {
-  const parts = text.split(/(```[\s\S]*?```)/g)
-  return parts.map((part, i) => {
-    if (part.startsWith('```')) {
-      const langMatch = part.match(/```(\w*)\n?/)
-      const lang = langMatch?.[1] || ''
-      const code = part.replace(/```\w*\n?/, '').replace(/```$/, '').trim()
-
-      let configObj = null
-      if (lang === 'json') {
-        try {
-          const obj = JSON.parse(code)
-          if (obj.outbounds || obj.inbounds || obj.routing || obj.protocol) configObj = obj
-        } catch (_) {}
-      }
-
-      return (
-        <div key={i} style={{ position: 'relative', margin: '8px 0' }}>
-          {lang && (
-            <div style={{
-              fontSize: '0.7rem', color: 'var(--text-muted)',
-              padding: '4px 12px 0', textTransform: 'uppercase', letterSpacing: '0.05em',
-            }}>{lang}</div>
-          )}
-          <pre style={{ position: 'relative' }}>
-            <code>{code}</code>
-            <button
-              onClick={() => onCopy?.(code)}
-              style={{
-                position: 'absolute', top: 8, right: 8, background: 'rgba(255,255,255,0.1)',
-                border: 'none', borderRadius: 4, color: 'var(--text-secondary)',
-                cursor: 'pointer', padding: '2px 8px', fontSize: '0.7rem',
-              }}
-            >
-              复制
-            </button>
-          </pre>
-          {configObj && onApplyConfig && (
-            <button
-              className="config-apply-btn"
-              onClick={() => onApplyConfig(configObj)}
-            >
-              ✨ 应用此配置
-            </button>
-          )}
-        </div>
-      )
-    }
-
-    return (
-      <span key={i}>
-        {part.split('\n').map((line, j) => {
-          if (line.startsWith('### ')) return <h3 key={j} style={{ margin: '8px 0 4px' }}>{line.slice(4)}</h3>
-          if (line.startsWith('## ')) return <h2 key={j} style={{ margin: '10px 0 4px' }}>{line.slice(3)}</h2>
-          if (line.startsWith('# ')) return <h1 key={j} style={{ margin: '12px 0 6px' }}>{line.slice(2)}</h1>
-          if (line.startsWith('- ') || line.startsWith('* '))
-            return <div key={j} style={{ paddingLeft: '1em' }}>• {processInline(line.slice(2))}</div>
-          if (/^\d+\.\s/.test(line)) {
-            const m = line.match(/^(\d+)\.\s(.*)/)
-            return <div key={j} style={{ paddingLeft: '1em' }}>{m[1]}. {processInline(m[2])}</div>
-          }
-          if (line.trim() === '') return <br key={j} />
-          return <p key={j} style={{ margin: '2px 0' }}>{processInline(line)}</p>
-        })}
-      </span>
-    )
-  })
+function isV2rayConfig(code) {
+  try {
+    const obj = JSON.parse(code)
+    return !!(obj && (obj.outbounds || obj.inbounds || obj.routing || obj.protocol))
+  } catch (_) {
+    return false
+  }
 }
 
-function processInline(text) {
-  const parts = text.split(/(\*\*.*?\*\*|`.*?`)/g)
-  return parts.map((part, i) => {
-    if (part.startsWith('**') && part.endsWith('**')) return <strong key={i}>{part.slice(2, -2)}</strong>
-    if (part.startsWith('`') && part.endsWith('`')) return <code key={i}>{part.slice(1, -1)}</code>
-    return part
-  })
+function renderMarkdown(text, onApplyConfig, onCopy) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        code({ inline, className, children, ...props }) {
+          const match = /language-(\w+)/.exec(className || '')
+          const lang = match?.[1] || ''
+          const code = String(children).replace(/\n$/, '')
+
+          if (inline) {
+            return <code className={className} {...props}>{children}</code>
+          }
+
+          const canApply = lang === 'json' && onApplyConfig && isV2rayConfig(code)
+
+          return (
+            <div style={{ position: 'relative', margin: '8px 0' }}>
+              {lang && (
+                <div style={{
+                  fontSize: '0.7rem', color: 'var(--text-muted)',
+                  padding: '4px 12px 0', textTransform: 'uppercase', letterSpacing: '0.05em',
+                }}>{lang}</div>
+              )}
+              <div style={{ position: 'relative' }}>
+                <Suspense fallback={<pre><code>{code}</code></pre>}>
+                  <SyntaxHighlighter
+                    language={lang || 'text'}
+                    customStyle={{
+                      margin: 0,
+                      borderRadius: 'var(--radius-sm, 6px)',
+                      fontSize: '0.8rem',
+                      background: 'rgba(0,0,0,0.35)',
+                    }}
+                    PreTag="pre"
+                  >
+                    {code}
+                  </SyntaxHighlighter>
+                </Suspense>
+                <button
+                  onClick={() => onCopy?.(code)}
+                  style={{
+                    position: 'absolute', top: 8, right: 8, background: 'rgba(255,255,255,0.1)',
+                    border: 'none', borderRadius: 4, color: 'var(--text-secondary)',
+                    cursor: 'pointer', padding: '2px 8px', fontSize: '0.7rem', zIndex: 1,
+                  }}
+                >
+                  复制
+                </button>
+              </div>
+              {canApply && (
+                <button
+                  className="config-apply-btn"
+                  onClick={() => {
+                    try { onApplyConfig(JSON.parse(code)) } catch (_) {}
+                  }}
+                >
+                  ✨ 应用此配置
+                </button>
+              )}
+            </div>
+          )
+        },
+        a({ node, ...props }) {
+          return <a {...props} target="_blank" rel="noopener noreferrer" />
+        },
+        table({ node, ...props }) {
+          return (
+            <div style={{ overflowX: 'auto', margin: '8px 0' }}>
+              <table style={{ borderCollapse: 'collapse', width: '100%' }} {...props} />
+            </div>
+          )
+        },
+        th({ node, ...props }) {
+          return <th style={{ border: '1px solid var(--border, #444)', padding: '4px 8px', textAlign: 'left' }} {...props} />
+        },
+        td({ node, ...props }) {
+          return <td style={{ border: '1px solid var(--border, #444)', padding: '4px 8px' }} {...props} />
+        },
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  )
 }
