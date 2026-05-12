@@ -605,6 +605,89 @@ textarea {
   transform: translateY(-1px);
 }
 
+.config-apply-btn:disabled {
+  cursor: default;
+  opacity: 0.65;
+  transform: none;
+  box-shadow: none;
+}
+
+.parsed-servers-panel {
+  margin-top: var(--space-md);
+  padding: var(--space-md);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+}
+
+.parsed-servers-title {
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  margin-bottom: var(--space-sm);
+}
+
+.parsed-servers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.parsed-server-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-md);
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.parsed-server-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parsed-server-row span:first-child {
+  color: var(--text-primary);
+}
+
+.parsed-server-more {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.app-action-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+  padding: var(--space-md);
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.22);
+  border-radius: var(--radius-md);
+}
+
+.app-action-title {
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.app-action-desc {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  margin-top: 2px;
+}
+
+.app-action-buttons {
+  display: flex;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+
 /* Chat Typing Indicator */
 .typing-indicator {
   display: flex;
@@ -787,6 +870,38 @@ textarea {
 .server-latency.fast { color: var(--status-online); }
 .server-latency.medium { color: var(--status-warning); }
 .server-latency.slow { color: var(--status-offline); }
+
+.latency-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.latency-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-glass);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.latency-badge.fast { color: var(--status-online); }
+.latency-badge.medium { color: var(--status-warning); }
+.latency-badge.slow { color: var(--status-offline); }
+
+.server-latency-error {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--status-offline);
+  font-size: var(--font-size-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .server-card-actions {
   display: flex;
@@ -1090,4 +1205,3 @@ textarea {
   transform: translateY(-3px);
   box-shadow: var(--shadow-md), 0 0 20px rgba(99, 102, 241, 0.06);
 }
-

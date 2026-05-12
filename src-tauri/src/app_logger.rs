@@ -3,6 +3,8 @@
 
 use log::{Level, Log, Metadata, Record};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +19,7 @@ const MAX_LOGS: usize = 1000;
 
 pub struct AppLogger {
     entries: Mutex<Vec<LogEntry>>,
+    log_path: PathBuf,
     env_logger: env_logger::Logger,
 }
 
@@ -28,8 +31,12 @@ impl AppLogger {
 
         let max_level = env_logger.filter();
 
+        let log_path = app_log_path();
+        let entries = load_recent_entries(&log_path, MAX_LOGS);
+
         let logger = Box::new(Self {
-            entries: Mutex::new(Vec::with_capacity(MAX_LOGS)),
+            entries: Mutex::new(entries),
+            log_path,
             env_logger,
         });
 
@@ -58,6 +65,7 @@ impl AppLogger {
 
     pub fn clear(&self) {
         self.entries.lock().unwrap().clear();
+        let _ = std::fs::remove_file(&self.log_path);
     }
 
     pub fn add_entry(&self, level: &str, target: &str, message: &str) {
@@ -73,6 +81,44 @@ impl AppLogger {
             entries.drain(0..200); // Remove oldest 200 when full
         }
         entries.push(entry);
+        if let Some(entry) = entries.last() {
+            append_entry(&self.log_path, entry);
+        }
+    }
+}
+
+fn app_log_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("logs")
+        .join("app.log")
+}
+
+fn load_recent_entries(path: &PathBuf, count: usize) -> Vec<LogEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::with_capacity(MAX_LOGS);
+    };
+
+    let mut entries: Vec<LogEntry> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<LogEntry>(line).ok())
+        .collect();
+
+    if entries.len() > count {
+        entries.drain(0..entries.len() - count);
+    }
+    entries
+}
+
+fn append_entry(path: &PathBuf, entry: &LogEntry) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(line) = serde_json::to_string(entry) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", line);
     }
 }
 

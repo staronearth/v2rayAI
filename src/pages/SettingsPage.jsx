@@ -215,7 +215,7 @@ export default function SettingsPage({ settings, setSettings }) {
                 id="ai-api-key-input"
               />
               <div style={{ marginTop: 6, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                API Key 仅保留在当前会话。
+                API Key 会加密保存到本地配置文件；macOS 下加密主密钥存放在系统 Keychain。
               </div>
             </div>
 
@@ -470,6 +470,29 @@ export default function SettingsPage({ settings, setSettings }) {
                 <option value="direct">🔓 直连模式（不使用代理）</option>
               </select>
             </div>
+
+            <label className="settings-field" style={{
+              display: 'flex',
+              gap: 'var(--space-sm)',
+              alignItems: 'flex-start',
+              cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={!!settings.allowLan}
+                onChange={e => updateSetting('allowLan', e.target.checked)}
+                id="allow-lan-input"
+                style={{ marginTop: 3, accentColor: 'var(--accent-primary)' }}
+              />
+              <span>
+                <span className="settings-label" style={{ display: 'block', marginBottom: 4 }}>
+                  允许局域网设备连接代理端口
+                </span>
+                <span style={{ display: 'block', color: 'var(--text-muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
+                  开启后 HTTP/SOCKS 入站监听 0.0.0.0，局域网设备可通过本机 IP 和上方端口连接。请只在可信网络中开启。
+                </span>
+              </span>
+            </label>
           </div>
         </div>
 

@@ -60,14 +60,25 @@ const QUICK_PROMPTS = [
 
 // ── Main Component ────────────────────────────────────────────────────────────
 
-export default function ChatPage({ settings, onAddServers, activeServer, isConnected }) {
-  // Current conversation
-  const [convId, setConvId] = useState(genId())
-  const [convTitle, setConvTitle] = useState('新对话')
-  const [messages, setMessages] = useState([])
-  const [inputValue, setInputValue] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-
+export default function ChatPage({
+  settings,
+  onAddServers,
+  onClearServers,
+  servers = [],
+  subscriptions = [],
+  activeServer,
+  isConnected,
+  convId,
+  setConvId,
+  convTitle,
+  setConvTitle,
+  messages,
+  setMessages,
+  inputValue,
+  setInputValue,
+  isLoading,
+  setIsLoading,
+}) {
   // History panel
   const [historyList, setHistoryList] = useState([])
   const [searchQuery, setSearchQuery] = useState('')
@@ -159,35 +170,50 @@ export default function ChatPage({ settings, onAddServers, activeServer, isConne
           api_key: settings.aiApiKey,
           model: settings.aiModel,
         },
-        context: activeServer ? {
-          server_name: activeServer.name,
-          protocol: activeServer.protocol,
+        context: {
+          server_name: activeServer?.name || null,
+          protocol: activeServer?.protocol || null,
           is_connected: !!isConnected,
-          latency_ms: activeServer.latency ? parseInt(activeServer.latency) : null,
+          latency_ms: activeServer?.latency ? parseInt(activeServer.latency) : null,
           routing_mode: settings.routingMode || 'smart',
-        } : null,
+          http_port: settings.httpPort,
+          socks_port: settings.socksPort,
+          allow_lan: !!settings.allowLan,
+          server_count: servers.length,
+          subscription_count: subscriptions.length,
+          servers: servers.slice(0, 80).map(s => ({
+            name: s.name,
+            protocol: s.protocol,
+            address: s.address,
+            port: s.port,
+            source: s.source || null,
+            sub_name: s.subName || null,
+            latency: s.latency || null,
+            tcp_latency: s.tcpLatency || null,
+            proxy_latency: s.proxyLatency || null,
+            allow_insecure: !!s.allowInsecure,
+            is_active: activeServer?.id === s.id,
+          })),
+          subscriptions: subscriptions.map(s => ({
+            name: s.name,
+            node_count: s.nodeCount || 0,
+            updated_at: s.updatedAt || null,
+          })),
+        },
       })
 
       // result is { message: string, parsedServers: ServerConfig[] }
       const aiText = result.message
-      const assistantMsg = { role: 'assistant', content: aiText, timestamp: Date.now() }
+      const assistantMsg = {
+        role: 'assistant',
+        content: aiText,
+        timestamp: Date.now(),
+        parsedServers: result.parsedServers || [],
+      }
       const finalMessages = [...newMessages, assistantMsg]
       setMessages(finalMessages)
       autoSave(finalMessages, convId, title)
 
-      // Auto-add servers parsed by tool execution
-      if (result.parsedServers?.length > 0 && onAddServers) {
-        const servers = result.parsedServers.map((s, i) => ({
-          ...s,
-          id: s.id || `tool-${Date.now()}-${i}`,
-          latency: null,
-          source: 'tool',
-        }))
-        onAddServers(servers)
-      }
-
-      // Also try to extract config from AI-generated JSON blocks
-      tryExtractConfig(aiText)
     } catch (e) {
       const errMsg = { role: 'assistant', content: `❌ 出错了: ${e}`, timestamp: Date.now() }
       setMessages(prev => [...prev, errMsg])
@@ -227,34 +253,6 @@ export default function ChatPage({ settings, onAddServers, activeServer, isConne
     } catch (e) {
       console.warn('Delete failed:', e)
     }
-  }
-
-  // ── Apply AI-generated config ───────────────────────────────────────────────
-  const tryExtractConfig = (text) => {
-    const jsonMatches = text.match(/```json\n([\s\S]*?)```/g)
-    if (!jsonMatches || !onAddServers) return
-    jsonMatches.forEach(match => {
-      try {
-        const code = match.replace(/```json\n?/, '').replace(/```$/, '').trim()
-        const config = JSON.parse(code)
-        if (config.outbounds) {
-          const proxies = config.outbounds.filter(
-            o => o.protocol !== 'freedom' && o.protocol !== 'blackhole'
-          )
-          const servers = proxies.map((proxy, i) => ({
-            id: `ai-${Date.now()}-${i}`,
-            name: `AI 生成 - ${proxy.protocol?.toUpperCase()}`,
-            protocol: proxy.protocol,
-            address: proxy.settings?.vnext?.[0]?.address || proxy.settings?.servers?.[0]?.address || 'unknown',
-            port: proxy.settings?.vnext?.[0]?.port || proxy.settings?.servers?.[0]?.port || 443,
-            fullConfig: config,
-            latency: null,
-            source: 'ai',
-          }))
-          if (servers.length > 0) onAddServers(servers)
-        }
-      } catch (_) {}
-    })
   }
 
   const handleKeyDown = (e) => {
@@ -416,7 +414,21 @@ export default function ChatPage({ settings, onAddServers, activeServer, isConne
               </div>
             </div>
           ) : (
-            messages.map((msg, i) => <MessageBubble key={i} msg={msg} onApplyConfig={config => {
+            messages.map((msg, i) => <MessageBubble key={i} msg={msg} onAppAction={action => {
+              if (action === 'clear_all_servers') {
+                onClearServers?.()
+              }
+            }} onAddParsedServers={servers => {
+              if (onAddServers) {
+                const preparedServers = servers.map((server, j) => ({
+                  ...server,
+                  id: server.id || `tool-${Date.now()}-${j}`,
+                  latency: null,
+                  source: 'tool',
+                }))
+                if (preparedServers.length) onAddServers(preparedServers)
+              }
+            }} onApplyConfig={config => {
               if (onAddServers) {
                 const proxies = config.outbounds?.filter(o => o.protocol !== 'freedom' && o.protocol !== 'blackhole') || []
                 const servers = proxies.map((proxy, j) => ({
@@ -478,8 +490,10 @@ export default function ChatPage({ settings, onAddServers, activeServer, isConne
 
 // ── Message Bubble ────────────────────────────────────────────────────────────
 
-function MessageBubble({ msg, onApplyConfig }) {
+function MessageBubble({ msg, onApplyConfig, onAddParsedServers, onAppAction }) {
   const [copied, setCopied] = useState(false)
+  const [parsedServersAdded, setParsedServersAdded] = useState(false)
+  const [completedActions, setCompletedActions] = useState({})
 
   const handleCopy = (text) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -495,6 +509,45 @@ function MessageBubble({ msg, onApplyConfig }) {
         <div className="chat-message-content selectable">
           {renderMarkdown(msg.content, onApplyConfig, handleCopy)}
         </div>
+        {extractAppActions(msg.content).map(action => (
+          <AppActionPanel
+            key={action}
+            action={action}
+            completed={!!completedActions[action]}
+            onConfirm={() => {
+              onAppAction?.(action)
+              setCompletedActions(prev => ({ ...prev, [action]: true }))
+            }}
+          />
+        ))}
+        {msg.role === 'assistant' && msg.parsedServers?.length > 0 && (
+          <div className="parsed-servers-panel">
+            <div className="parsed-servers-title">
+              解析结果：{msg.parsedServers.length} 个节点
+            </div>
+            <div className="parsed-servers-list">
+              {msg.parsedServers.slice(0, 5).map((server, i) => (
+                <div key={`${server.name}-${i}`} className="parsed-server-row">
+                  <span>{server.name || `${server.protocol?.toUpperCase() || '代理'} 节点`}</span>
+                  <span>{server.protocol?.toUpperCase()} · {server.address}:{server.port}</span>
+                </div>
+              ))}
+              {msg.parsedServers.length > 5 && (
+                <div className="parsed-server-more">还有 {msg.parsedServers.length - 5} 个节点</div>
+              )}
+            </div>
+            <button
+              className="config-apply-btn"
+              disabled={parsedServersAdded}
+              onClick={() => {
+                onAddParsedServers?.(msg.parsedServers)
+                setParsedServersAdded(true)
+              }}
+            >
+              {parsedServersAdded ? '已添加到节点列表' : '添加到节点列表'}
+            </button>
+          </div>
+        )}
         {msg.timestamp && (
           <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginTop: 4, textAlign: msg.role === 'user' ? 'right' : 'left' }}>
             {formatTime(msg.timestamp)}
@@ -518,7 +571,49 @@ function isV2rayConfig(code) {
   }
 }
 
+function extractAppActions(text) {
+  const actions = []
+  const re = /\[\[APP_ACTION:([a-zA-Z0-9_]+)\]\]/g
+  let match
+  while ((match = re.exec(text)) !== null) {
+    if (!actions.includes(match[1])) actions.push(match[1])
+  }
+  return actions
+}
+
+function stripAppActions(text) {
+  return text.replace(/\[\[APP_ACTION:[a-zA-Z0-9_]+\]\]/g, '').trim()
+}
+
+function AppActionPanel({ action, completed, onConfirm }) {
+  const [confirming, setConfirming] = useState(false)
+
+  if (action !== 'clear_all_servers') return null
+
+  return (
+    <div className="app-action-panel">
+      <div>
+        <div className="app-action-title">清空所有节点和订阅</div>
+        <div className="app-action-desc">此操作会先断开当前连接，然后删除节点管理中的所有节点和订阅。</div>
+      </div>
+      {confirming ? (
+        <div className="app-action-buttons">
+          <button className="btn btn-secondary btn-sm" onClick={() => setConfirming(false)}>取消</button>
+          <button className="btn btn-danger btn-sm" disabled={completed} onClick={onConfirm}>
+            {completed ? '已清空' : '确认清空'}
+          </button>
+        </div>
+      ) : (
+        <button className="btn btn-danger btn-sm" disabled={completed} onClick={() => setConfirming(true)}>
+          {completed ? '已清空' : '清空所有节点'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 function renderMarkdown(text, onApplyConfig, onCopy) {
+  const cleanText = stripAppActions(text)
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -575,7 +670,7 @@ function renderMarkdown(text, onApplyConfig, onCopy) {
                     try { onApplyConfig(JSON.parse(code)) } catch (_) {}
                   }}
                 >
-                  ✨ 应用此配置
+                  添加此配置
                 </button>
               )}
             </div>
@@ -599,7 +694,7 @@ function renderMarkdown(text, onApplyConfig, onCopy) {
         },
       }}
     >
-      {text}
+      {cleanText}
     </ReactMarkdown>
   )
 }

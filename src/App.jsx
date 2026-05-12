@@ -51,6 +51,27 @@ async function saveToStore(key, value) {
   }
 }
 
+async function loadSecureApiKey() {
+  try {
+    return await invoke('load_ai_api_key')
+  } catch (e) {
+    console.warn('Load encrypted API key failed:', e)
+    return ''
+  }
+}
+
+async function saveSecureApiKey(apiKey) {
+  try {
+    if (apiKey) {
+      await invoke('save_ai_api_key', { apiKey })
+    } else {
+      await invoke('clear_ai_api_key')
+    }
+  } catch (e) {
+    console.warn('Save encrypted API key failed:', e)
+  }
+}
+
 // ── Default settings ──────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS = {
@@ -62,8 +83,13 @@ const DEFAULT_SETTINGS = {
   coreType: 'xray',
   httpPort: 10808,
   socksPort: 10809,
+  allowLan: false,
   routingMode: 'rule',
   language: 'zh',
+}
+
+function genChatId() {
+  return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
 }
 
 // ── App Component ─────────────────────────────────────────────────────────────
@@ -77,6 +103,11 @@ function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS)
   const [loaded, setLoaded] = useState(false)
   const [globalToast, setGlobalToast] = useState(null) // { type: 'error'|'info', message: string }
+  const [chatConvId, setChatConvId] = useState(genChatId())
+  const [chatConvTitle, setChatConvTitle] = useState('新对话')
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInputValue, setChatInputValue] = useState('')
+  const [chatIsLoading, setChatIsLoading] = useState(false)
 
   const saveServersTimer = useRef(null)
 
@@ -88,8 +119,9 @@ function App() {
         loadFromStore('servers', []),
         loadFromStore('subscriptions', []),
       ])
+      const savedApiKey = await loadSecureApiKey()
       
-      let finalSettings = { ...DEFAULT_SETTINGS, ...savedSettings, aiApiKey: '' }
+      let finalSettings = { ...DEFAULT_SETTINGS, ...savedSettings, aiApiKey: savedApiKey || '' }
       
       setSettings(finalSettings)
       if (savedServers.length > 0) setServers(savedServers)
@@ -111,6 +143,7 @@ function App() {
   useEffect(() => {
     if (!loaded) return
     saveToStore('settings', settings)
+    saveSecureApiKey(settings.aiApiKey || '')
   }, [settings, loaded])
 
   // ── Auto-save servers (debounced 1s) ───────────────────────────────────────
@@ -119,7 +152,7 @@ function App() {
     saveServersTimer.current = setTimeout(() => {
       // Strip transient fields before saving
       const toSave = srvs.map(s => {
-        const { latency, ...rest } = s
+        const { latency, tcpLatency, proxyLatency, latencyError, latencyTesting, ...rest } = s
         return rest
       })
       saveToStore('servers', toSave)
@@ -174,7 +207,8 @@ function App() {
           server,
           httpPort: settings.httpPort,
           socksPort: settings.socksPort,
-          routingMode: settings.routingMode
+          routingMode: settings.routingMode,
+          allowLan: !!settings.allowLan,
         })
       }
       
@@ -224,18 +258,42 @@ function App() {
     setServers(prev => [...prev, ...newServers])
   }
 
+  const handleClearServers = async () => {
+    if (connectionStatus === 'connected' || connectionStatus === 'connecting') {
+      await handleDisconnect()
+    }
+    setActiveServer(null)
+    setServers([])
+    setSubscriptions([])
+  }
+
+  const renderChatPage = () => (
+    <ChatPage
+      settings={settings}
+      onAddServers={handleAddServers}
+      onClearServers={handleClearServers}
+      servers={servers}
+      subscriptions={subscriptions}
+      activeServer={activeServer}
+      isConnected={connectionStatus === 'connected'}
+      convId={chatConvId}
+      setConvId={setChatConvId}
+      convTitle={chatConvTitle}
+      setConvTitle={setChatConvTitle}
+      messages={chatMessages}
+      setMessages={setChatMessages}
+      inputValue={chatInputValue}
+      setInputValue={setChatInputValue}
+      isLoading={chatIsLoading}
+      setIsLoading={setChatIsLoading}
+    />
+  )
+
   // ── Render ──────────────────────────────────────────────────────────────────
   const renderPage = () => {
     switch (currentPage) {
       case 'chat':
-        return (
-          <ChatPage
-            settings={settings}
-            onAddServers={handleAddServers}
-            activeServer={activeServer}
-            isConnected={connectionStatus === 'connected'}
-          />
-        )
+        return renderChatPage()
       case 'servers':
         return (
           <ServersPage
@@ -243,6 +301,7 @@ function App() {
             setServers={setServers}
             subscriptions={subscriptions}
             setSubscriptions={setSubscriptions}
+            settings={settings}
             activeServer={activeServer}
             onConnect={handleConnect}
             onDisconnect={handleDisconnect}
@@ -269,7 +328,7 @@ function App() {
           />
         )
       default:
-        return <ChatPage settings={settings} onAddServers={handleAddServers} />
+        return renderChatPage()
     }
   }
 

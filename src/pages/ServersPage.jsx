@@ -22,15 +22,15 @@ function fmtTime(ts) {
 
 // Protocol-specific default fields
 const PROTOCOL_DEFAULTS = {
-  vless:       { encryption: 'none', flow: '', network: 'tcp', security: 'tls', sni: '', fingerprint: 'chrome', path: '', host: '', uuid: '', realityPublicKey: '', realityShortId: '' },
-  vmess:       { alterId: 0, encryption: 'auto', network: 'tcp', security: 'none', sni: '', path: '', host: '', uuid: '' },
-  trojan:      { password: '', network: 'tcp', security: 'tls', sni: '', fingerprint: 'chrome', path: '' },
+  vless:       { encryption: 'none', flow: '', network: 'tcp', security: 'tls', sni: '', fingerprint: 'chrome', path: '', host: '', uuid: '', realityPublicKey: '', realityShortId: '', allowInsecure: false },
+  vmess:       { alterId: 0, encryption: 'auto', network: 'tcp', security: 'none', sni: '', path: '', host: '', uuid: '', allowInsecure: false },
+  trojan:      { password: '', network: 'tcp', security: 'tls', sni: '', fingerprint: 'chrome', path: '', allowInsecure: false },
   shadowsocks: { password: '', encryption: 'aes-256-gcm' },
 }
 
 // ── Main Page ──────────────────────────────────────────────────────────────────
 
-export default function ServersPage({ servers, setServers, subscriptions, setSubscriptions, activeServer, onConnect, onDisconnect, onNavigate }) {
+export default function ServersPage({ servers, setServers, subscriptions, setSubscriptions, settings, activeServer, onConnect, onDisconnect, onNavigate }) {
   const [tab, setTab] = useState('nodes')
   const [showAddModal,  setShowAddModal]  = useState(false)
   const [showSubModal,  setShowSubModal]  = useState(false)
@@ -63,20 +63,37 @@ export default function ServersPage({ servers, setServers, subscriptions, setSub
   }
 
   const handleTestLatency = async (server) => {
-    setServers(prev => prev.map(s => s.id === server.id ? { ...s, latency: 'testing...' } : s))
+    const isActive = activeServer?.id === server.id
+    setServers(prev => prev.map(s => s.id === server.id
+      ? { ...s, latencyTesting: true, latencyError: null }
+      : s
+    ))
     try {
       const result = await invoke('test_latency', {
         host: server.address,
         port: server.port,
-        httpProxyPort: null,
+        httpProxyPort: isActive ? settings.httpPort : null,
       })
-      const ms = result.tcp_ms !== undefined ? result.tcp_ms : null
+      const tcpMs = result.tcp_ms ?? null
+      const proxyMs = result.http_ms ?? null
       setServers(prev => prev.map(s => s.id === server.id
-        ? { ...s, latency: ms !== null ? `${ms}ms` : '超时' }
+        ? {
+            ...s,
+            latencyTesting: false,
+            tcpLatency: tcpMs !== null ? `${tcpMs}ms` : null,
+            proxyLatency: proxyMs !== null ? `${proxyMs}ms` : null,
+            latency: (isActive && proxyMs !== null)
+              ? `${proxyMs}ms`
+              : tcpMs !== null ? `${tcpMs}ms` : '超时',
+            latencyError: result.reachable ? null : (result.error || '不可用'),
+          }
         : s
       ))
-    } catch (_) {
-      setServers(prev => prev.map(s => s.id === server.id ? { ...s, latency: '失败' } : s))
+    } catch (err) {
+      setServers(prev => prev.map(s => s.id === server.id
+        ? { ...s, latencyTesting: false, latency: '失败', latencyError: `${err}` }
+        : s
+      ))
     }
   }
 
@@ -188,6 +205,13 @@ export default function ServersPage({ servers, setServers, subscriptions, setSub
     setShowAddModal(false)
   }
 
+  const handleToggleAllowInsecure = (server) => {
+    setServers(prev => prev.map(s => s.id === server.id
+      ? { ...s, allowInsecure: !s.allowInsecure }
+      : s
+    ))
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="chat-container">
@@ -262,6 +286,7 @@ export default function ServersPage({ servers, setServers, subscriptions, setSub
                   onConnect={() => handleConnect(server)}
                   onDisconnect={() => onDisconnect()}
                   onTest={() => handleTestLatency(server)}
+                  onToggleAllowInsecure={() => handleToggleAllowInsecure(server)}
                   onDelete={() => handleDelete(server.id)}
                 />
               ))}
@@ -481,8 +506,9 @@ function SubCard({ sub, nodeCount, updating, onUpdate, onDelete, onFilter }) {
 
 // ── Server Card ───────────────────────────────────────────────────────────────
 
-function ServerCard({ server, active, onConnect, onDisconnect, onTest, onDelete }) {
+function ServerCard({ server, active, onConnect, onDisconnect, onTest, onToggleAllowInsecure, onDelete }) {
   const [expanded, setExpanded] = useState(false)
+  const canToggleAllowInsecure = ['trojan', 'vless', 'vmess'].includes(server.protocol) && (server.security === 'tls' || server.security === 'reality')
 
   return (
     <div className={`server-card ${active ? 'active' : ''}`}>
@@ -505,10 +531,34 @@ function ServerCard({ server, active, onConnect, onDisconnect, onTest, onDelete 
             <span>{server.network?.toUpperCase()}{server.security ? ` + ${server.security?.toUpperCase()}` : ''}</span>
           </div>
         )}
-        {server.latency && (
+        {(server.latencyTesting || server.tcpLatency || server.proxyLatency || server.latency) && (
           <div className="server-info-row">
             <span>⚡</span>
-            <span className={`server-latency ${getLatencyClass(server.latency)}`}>{server.latency}</span>
+            {server.latencyTesting ? (
+              <span className="server-latency">测速中...</span>
+            ) : (
+              <span className="latency-badges">
+                {server.tcpLatency && (
+                  <span className={`latency-badge ${getLatencyClass(server.tcpLatency)}`}>
+                    TCP {server.tcpLatency}
+                  </span>
+                )}
+                {active && (
+                  <span className={`latency-badge ${server.proxyLatency ? getLatencyClass(server.proxyLatency) : 'slow'}`}>
+                    真实 {server.proxyLatency || '失败'}
+                  </span>
+                )}
+                {!server.tcpLatency && !active && server.latency && (
+                  <span className={`latency-badge ${getLatencyClass(server.latency)}`}>{server.latency}</span>
+                )}
+              </span>
+            )}
+          </div>
+        )}
+        {server.latencyError && (
+          <div className="server-info-row">
+            <span>⚠️</span>
+            <span className="server-latency-error" title={server.latencyError}>{server.latencyError}</span>
           </div>
         )}
         {server.subName && (
@@ -531,7 +581,27 @@ function ServerCard({ server, active, onConnect, onDisconnect, onTest, onDelete 
           {server.flow             && <div>Flow: {server.flow}</div>}
           {server.path             && <div>Path: {server.path}</div>}
           {server.fingerprint      && <div>Fingerprint: {server.fingerprint}</div>}
+          {canToggleAllowInsecure  && <div>AllowInsecure: {server.allowInsecure ? 'true' : 'false'}</div>}
           {server.realityPublicKey && <div>PublicKey: {server.realityPublicKey?.slice(0, 20)}...</div>}
+          {canToggleAllowInsecure && (
+            <label style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              marginTop: 8,
+              fontFamily: 'var(--font-family)',
+              color: server.allowInsecure ? 'var(--status-warning)' : 'var(--text-secondary)',
+              cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={!!server.allowInsecure}
+                onChange={onToggleAllowInsecure}
+                style={{ accentColor: 'var(--status-warning)' }}
+              />
+              跳过证书验证（AllowInsecure）
+            </label>
+          )}
         </div>
       )}
 
@@ -593,6 +663,26 @@ function AddServerModal({ onClose, onAdd }) {
     </div>
   )
 
+  const checkbox = (label, key, help, obj, setObj) => (
+    <label className="settings-field" key={key} style={{
+      display: 'flex',
+      alignItems: 'flex-start',
+      gap: 'var(--space-sm)',
+      cursor: 'pointer',
+    }}>
+      <input
+        type="checkbox"
+        checked={!!obj[key]}
+        onChange={e => setObj(prev => ({ ...prev, [key]: e.target.checked }))}
+        style={{ marginTop: 3, accentColor: 'var(--status-warning)' }}
+      />
+      <span>
+        <span className="settings-label" style={{ display: 'block', marginBottom: 4 }}>{label}</span>
+        {help && <span style={{ display: 'block', color: 'var(--text-muted)', fontSize: '0.72rem', lineHeight: 1.5 }}>{help}</span>}
+      </span>
+    </label>
+  )
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520, maxHeight: '80vh', overflowY: 'auto' }}>
@@ -620,6 +710,7 @@ function AddServerModal({ onClose, onAdd }) {
             {(extra.security === 'tls' || extra.security === 'reality') && <>
               {field('SNI / 服务器名称', 'sni', 'example.com', 'text', extra, setExtra)}
               {sel('Fingerprint', 'fingerprint', ['chrome', 'firefox', 'safari', 'ios', 'edge', 'random'], extra, setExtra)}
+              {checkbox('跳过证书验证（AllowInsecure）', 'allowInsecure', '仅在节点证书异常或服务商明确要求时开启。', extra, setExtra)}
             </>}
             {extra.network === 'ws' && <>
               {field('WS Path', 'path', '/', 'text', extra, setExtra)}
@@ -638,7 +729,10 @@ function AddServerModal({ onClose, onAdd }) {
             {sel('加密', 'encryption', ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none'], extra, setExtra)}
             {sel('传输', 'network', ['tcp', 'ws', 'grpc', 'http'], extra, setExtra)}
             {sel('安全', 'security', ['none', 'tls'], extra, setExtra)}
-            {extra.security === 'tls' && field('SNI', 'sni', 'example.com', 'text', extra, setExtra)}
+            {extra.security === 'tls' && <>
+              {field('SNI', 'sni', 'example.com', 'text', extra, setExtra)}
+              {checkbox('跳过证书验证（AllowInsecure）', 'allowInsecure', '仅在节点证书异常或服务商明确要求时开启。', extra, setExtra)}
+            </>}
             {extra.network === 'ws' && <>
               {field('WS Path', 'path', '/', 'text', extra, setExtra)}
               {field('WS Host', 'host', 'example.com', 'text', extra, setExtra)}
@@ -650,6 +744,7 @@ function AddServerModal({ onClose, onAdd }) {
             {sel('传输', 'network', ['tcp', 'ws', 'grpc'], extra, setExtra)}
             {field('SNI', 'sni', 'example.com', 'text', extra, setExtra)}
             {sel('Fingerprint', 'fingerprint', ['chrome', 'firefox', 'safari', 'ios', 'edge', 'random'], extra, setExtra)}
+            {checkbox('跳过证书验证（AllowInsecure）', 'allowInsecure', '等同 v2rayN 的 AllowInsecure；开启后不校验服务端证书。', extra, setExtra)}
             {extra.network === 'ws' && field('WS Path', 'path', '/', 'text', extra, setExtra)}
           </>}
 

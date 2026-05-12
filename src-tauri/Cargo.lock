@@ -5148,16 +5148,21 @@ dependencies = [
 name = "v2rayai"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "base64 0.22.1",
  "chrono",
+ "cipher",
  "env_logger",
  "flate2",
  "futures-util",
+ "hmac",
  "log",
+ "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tauri",
  "tauri-build",

@@ -21,6 +21,7 @@ export default function LogsPage({ settings }) {
   const [levelFilter, setLevelFilter] = useState('ALL')
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
+  const [copyState, setCopyState] = useState('')
   const logsEndRef = useRef(null)
   const intervalRef = useRef(null)
 
@@ -29,12 +30,12 @@ export default function LogsPage({ settings }) {
     try {
       if (activeTab === 'app') {
         const logs = await invoke('get_app_logs', {
-          count: 200,
+          count: 1000,
           levelFilter: levelFilter === 'ALL' ? null : levelFilter,
         })
         setAppLogs(logs)
       } else {
-        const logs = await invoke('get_core_logs', { count: 200 })
+        const logs = await invoke('get_core_logs', { count: 1000 })
         setCoreLogs(logs)
       }
     } catch (e) {
@@ -60,16 +61,18 @@ export default function LogsPage({ settings }) {
 
   const handleClear = async () => {
     try {
-      await invoke('clear_app_logs')
-      setAppLogs([])
+      if (activeTab === 'app') {
+        await invoke('clear_app_logs')
+        setAppLogs([])
+      } else {
+        await invoke('clear_core_logs')
+        setCoreLogs([])
+      }
     } catch (e) { console.warn(e) }
   }
 
   const handleExport = () => {
-    const logs = activeTab === 'app' ? appLogs : coreLogs
-    const text = activeTab === 'app'
-      ? logs.map(l => `[${formatTs(l.timestamp)}] [${l.level}] [${l.target}] ${l.message}`).join('\n')
-      : logs.join('\n')
+    const text = getVisibleLogsText()
     const blob = new Blob([text], { type: 'text/plain' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -77,6 +80,29 @@ export default function LogsPage({ settings }) {
     a.download = `v2rayai-${activeTab}-logs-${Date.now()}.txt`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  const getVisibleLogsText = () => {
+    if (activeTab === 'app') {
+      return filteredAppLogs
+        .map(l => `[${formatTs(l.timestamp)}] [${l.level}] [${l.target}] ${l.message}`)
+        .join('\n')
+    }
+    return filteredCoreLogs.join('\n')
+  }
+
+  const handleCopy = async () => {
+    const text = getVisibleLogsText()
+    if (!text) return
+
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopyState('已复制')
+    } catch (err) {
+      console.warn('Copy logs failed:', err)
+      setCopyState('复制失败')
+    }
+    setTimeout(() => setCopyState(''), 1800)
   }
 
   // Filtered display
@@ -96,6 +122,9 @@ export default function LogsPage({ settings }) {
           <div className="page-subtitle">应用运行日志与内核输出</div>
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
+          <button className="btn btn-secondary btn-sm" onClick={handleCopy} id="copy-logs-btn">
+            {copyState || '复制当前日志'}
+          </button>
           <button className="btn btn-secondary btn-sm" onClick={handleExport} id="export-logs-btn">📥 导出</button>
           <button className="btn btn-secondary btn-sm" onClick={handleClear} id="clear-logs-btn">🗑️ 清空</button>
         </div>
@@ -185,7 +214,7 @@ export default function LogsPage({ settings }) {
       </div>
 
       {/* Log entries */}
-      <div style={{
+      <div className="selectable" style={{
         flex: 1, overflow: 'auto', padding: '0 var(--space-lg) var(--space-md)',
         fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', monospace",
         fontSize: '0.76rem', lineHeight: 1.5,

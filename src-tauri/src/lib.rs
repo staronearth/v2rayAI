@@ -5,6 +5,7 @@ mod config_manager;
 mod core_manager;
 mod health_monitor;
 mod knowledge_base;
+mod secure_store;
 mod sub_converter;
 mod sys_proxy;
 mod app_logger;
@@ -61,6 +62,26 @@ fn clear_app_logs() {
     if let Some(logger) = APP_LOGGER.get() {
         logger.clear();
     }
+}
+
+#[tauri::command]
+async fn save_ai_api_key(api_key: String) -> Result<(), String> {
+    secure_store::save_ai_api_key(api_key).await
+}
+
+#[tauri::command]
+async fn load_ai_api_key() -> Result<Option<String>, String> {
+    secure_store::load_ai_api_key().await
+}
+
+#[tauri::command]
+async fn clear_ai_api_key() -> Result<(), String> {
+    secure_store::clear_ai_api_key().await
+}
+
+#[tauri::command]
+async fn clear_core_logs(state: State<'_, AppState>) -> Result<(), String> {
+    state.core_manager.clear_logs().await
 }
 
 // ============================================================
@@ -123,6 +144,35 @@ pub struct ConnectionContext {
     pub is_connected: bool,
     pub latency_ms: Option<u64>,
     pub routing_mode: Option<String>,
+    pub http_port: Option<u16>,
+    pub socks_port: Option<u16>,
+    pub allow_lan: Option<bool>,
+    pub server_count: Option<usize>,
+    pub subscription_count: Option<usize>,
+    pub servers: Option<Vec<ServerContext>>,
+    pub subscriptions: Option<Vec<SubscriptionContext>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServerContext {
+    pub name: Option<String>,
+    pub protocol: Option<String>,
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    pub source: Option<String>,
+    pub sub_name: Option<String>,
+    pub latency: Option<String>,
+    pub tcp_latency: Option<String>,
+    pub proxy_latency: Option<String>,
+    pub allow_insecure: Option<bool>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubscriptionContext {
+    pub name: Option<String>,
+    pub node_count: Option<usize>,
+    pub updated_at: Option<i64>,
 }
 
 /// Result of a tool execution: text description for the AI + optional parsed servers.
@@ -130,6 +180,13 @@ struct ToolResult {
     text: String,
     servers: Vec<ServerConfig>,
 }
+
+const ALLOWED_AGENT_TOOLS: &[&str] = &[
+    "fetch_subscription",
+    "convert_subscription",
+    "subconverter_status",
+    "parse_proxy_links",
+];
 
 /// Parse `[[TOOL:tool_name(args)]]` markers from AI response text.
 /// Returns a list of (tool_name, args) tuples.
@@ -141,6 +198,9 @@ fn parse_tool_calls(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn is_allowed_agent_tool(tool_name: &str) -> bool {
+    ALLOWED_AGENT_TOOLS.contains(&tool_name)
+}
 
 /// Execute a single tool call and return text result + any parsed servers.
 async fn execute_tool(
@@ -314,7 +374,7 @@ fn format_servers_result(servers: &[ServerConfig]) -> String {
 
 /// Strip tool call markers from the AI response text.
 fn strip_tool_markers(text: &str) -> String {
-    let re = Regex::new(r"\[\[TOOL:(\w+)\(.+?\)\]\]").unwrap();
+    let re = Regex::new(r"(?s)\[\[TOOL:(\w+)\(.*?\)\]\]").unwrap();
     re.replace_all(text, "🔧 *正在调用工具 `$1`...*").to_string()
 }
 
@@ -355,15 +415,53 @@ async fn chat_with_ai(
         enriched.push_str(&hist_rag);
     }
 
-    // ── Inject current connection state ──
+    // ── Inject current connection state and local app snapshot ──
     if let Some(ctx) = context {
+        let mut server_lines = Vec::new();
+        if let Some(servers) = &ctx.servers {
+            for (idx, server) in servers.iter().take(80).enumerate() {
+                server_lines.push(format!(
+                    "{}. {}{} [{}] {}:{} | 来源:{}{}{}{}",
+                    idx + 1,
+                    if server.is_active.unwrap_or(false) { "*" } else { "" },
+                    server.name.as_deref().unwrap_or("未命名节点"),
+                    server.protocol.as_deref().unwrap_or("unknown").to_uppercase(),
+                    server.address.as_deref().unwrap_or("unknown"),
+                    server.port.unwrap_or(0),
+                    server.source.as_deref().unwrap_or("unknown"),
+                    server.sub_name.as_ref().map(|s| format!(" | 订阅:{}", s)).unwrap_or_default(),
+                    server.latency.as_ref().map(|s| format!(" | 延迟:{}", s)).unwrap_or_default(),
+                    if server.allow_insecure.unwrap_or(false) { " | allowInsecure:true" } else { "" },
+                ));
+            }
+        }
+
+        let mut sub_lines = Vec::new();
+        if let Some(subscriptions) = &ctx.subscriptions {
+            for (idx, sub) in subscriptions.iter().enumerate() {
+                sub_lines.push(format!(
+                    "{}. {} | 节点:{}",
+                    idx + 1,
+                    sub.name.as_deref().unwrap_or("未命名订阅"),
+                    sub.node_count.unwrap_or(0),
+                ));
+            }
+        }
+
         enriched.push_str(&format!(
-            "\n\n---\n**[当前连接状态]** 已连接:{} | 节点:{} | 协议:{} | 延迟:{}ms | 路由:{}",
+            "\n\n---\n**[本地环境快照]**\n连接: {} | 当前节点:{} | 协议:{} | 延迟:{}ms\n代理端口: HTTP {} / SOCKS {} | LAN开放:{} | 路由:{}\n节点总数:{} | 订阅总数:{}\n\n**[节点管理列表]**\n{}\n\n**[订阅列表]**\n{}",
             ctx.is_connected,
             ctx.server_name.unwrap_or("无".into()),
             ctx.protocol.unwrap_or("无".into()),
             ctx.latency_ms.unwrap_or(0),
+            ctx.http_port.unwrap_or(0),
+            ctx.socks_port.unwrap_or(0),
+            ctx.allow_lan.unwrap_or(false),
             ctx.routing_mode.unwrap_or("smart".into()),
+            ctx.server_count.unwrap_or(0),
+            ctx.subscription_count.unwrap_or(0),
+            if server_lines.is_empty() { "无节点".to_string() } else { server_lines.join("\n") },
+            if sub_lines.is_empty() { "无订阅".to_string() } else { sub_lines.join("\n") },
         ));
     }
 
@@ -391,12 +489,28 @@ async fn chat_with_ai(
 
         let mut tool_results = String::new();
         for (name, args) in &tool_calls {
-            log::info!("[Tool Loop] Executing: {}({})", name, args);
+            if !is_allowed_agent_tool(name) {
+                log::warn!("[Agent Policy] Blocked non-allowlisted tool call: {}", name);
+                tool_results.push_str(&format!(
+                    "\n[[TOOL_RESULT:{}]]\n策略拦截：该工具不在当前 agent allowlist 中。允许的工具：{}\n[[/TOOL_RESULT]]\n",
+                    name,
+                    ALLOWED_AGENT_TOOLS.join(", ")
+                ));
+                continue;
+            }
+
+            log::info!("[Agent Audit] Tool call approved: {} ({} chars)", name, args.len());
             let result = execute_tool(name, args, &sub_converter).await;
+            let parsed_count = result.servers.len();
             // Collect servers from tool results
             if !result.servers.is_empty() {
                 all_parsed_servers.extend(result.servers);
             }
+            log::info!(
+                "[Agent Audit] Tool call completed: {} ({} parsed server(s))",
+                name,
+                parsed_count
+            );
             tool_results.push_str(&format!(
                 "\n[[TOOL_RESULT:{}]]\n{}\n[[/TOOL_RESULT]]\n",
                 name, result.text
@@ -516,8 +630,10 @@ fn generate_config(
     http_port: u16,
     socks_port: u16,
     routing_mode: String,
+    allow_lan: Option<bool>,
 ) -> serde_json::Value {
-    server.to_v2ray_config(http_port, socks_port, &routing_mode)
+    let listen_host = if allow_lan.unwrap_or(false) { "0.0.0.0" } else { "127.0.0.1" };
+    server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen_host)
 }
 
 #[tauri::command]
@@ -526,9 +642,11 @@ async fn apply_config(
     http_port: u16,
     socks_port: u16,
     routing_mode: String,
+    allow_lan: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let config = server.to_v2ray_config(http_port, socks_port, &routing_mode);
+    let listen_host = if allow_lan.unwrap_or(false) { "0.0.0.0" } else { "127.0.0.1" };
+    let config = server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen_host);
     state.config_manager.write_active_config(&config).await
 }
 
@@ -844,6 +962,10 @@ pub fn run() {
             // Logs
             get_app_logs,
             clear_app_logs,
+            clear_core_logs,
+            save_ai_api_key,
+            load_ai_api_key,
+            clear_ai_api_key,
             // History
             save_chat,
             load_chat,
@@ -911,6 +1033,25 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "fetch_subscription");
         assert_eq!(calls[0].1, "https://example.com/sub");
+    }
+
+    #[test]
+    fn test_allowed_agent_tools_include_declared_tools() {
+        for tool in [
+            "fetch_subscription",
+            "convert_subscription",
+            "subconverter_status",
+            "parse_proxy_links",
+        ] {
+            assert!(is_allowed_agent_tool(tool));
+        }
+    }
+
+    #[test]
+    fn test_agent_tool_allowlist_blocks_unknown_tools() {
+        assert!(!is_allowed_agent_tool("start_core"));
+        assert!(!is_allowed_agent_tool("write_file"));
+        assert!(!is_allowed_agent_tool("shell"));
     }
 
     #[test]
@@ -982,7 +1123,7 @@ mod tests {
             uuid: None, password: None, alter_id: None, encryption: None,
             flow: None, network: None, security: None, sni: None,
             path: None, host: None, reality_public_key: None,
-            reality_short_id: None, fingerprint: None,
+            reality_short_id: None, fingerprint: None, allow_insecure: None,
         }];
         let result = format_servers_result(&servers);
         assert!(result.contains("1 个节点"));
@@ -1003,7 +1144,7 @@ mod tests {
                 uuid: None, password: None, alter_id: None, encryption: None,
                 flow: None, network: None, security: None, sni: None,
                 path: None, host: None, reality_public_key: None,
-                reality_short_id: None, fingerprint: None,
+                reality_short_id: None, fingerprint: None, allow_insecure: None,
             })
             .collect();
 
@@ -1048,5 +1189,16 @@ mod tests {
         let result = strip_tool_markers(text);
         assert!(result.contains("开始文本"));
         assert!(result.contains("结束文本"));
+    }
+
+    #[test]
+    fn test_strip_tool_markers_multiline_and_empty_args() {
+        let text = "开始\n[[TOOL:parse_proxy_links(vmess://abc\nvless://def)]]\n[[TOOL:subconverter_status()]]\n结束";
+        let result = strip_tool_markers(text);
+        assert!(!result.contains("[[TOOL:"));
+        assert!(result.contains("parse_proxy_links"));
+        assert!(result.contains("subconverter_status"));
+        assert!(result.contains("开始"));
+        assert!(result.contains("结束"));
     }
 }

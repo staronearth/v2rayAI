@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,8 @@ use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+const MAX_CORE_LOG_LINES: usize = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreStatus {
@@ -28,15 +30,18 @@ pub struct CoreManager {
     core_type: Arc<Mutex<String>>,
     start_time: Arc<Mutex<Option<std::time::Instant>>>,
     logs: Arc<Mutex<Vec<String>>>,
+    log_path: PathBuf,
 }
 
 impl CoreManager {
     pub fn new() -> Self {
+        let log_path = core_log_path();
         Self {
             child: Arc::new(Mutex::new(None)),
             core_type: Arc::new(Mutex::new("xray".to_string())),
             start_time: Arc::new(Mutex::new(None)),
-            logs: Arc::new(Mutex::new(Vec::new())),
+            logs: Arc::new(Mutex::new(load_recent_core_logs(&log_path, 500))),
+            log_path,
         }
     }
 
@@ -52,6 +57,7 @@ impl CoreManager {
         }
 
         self.stop().await?;
+        self.stop_stale_cores(core_path, config_path).await;
 
         let mut cmd = Command::new(core_path);
         cmd.arg("run")
@@ -65,16 +71,19 @@ impl CoreManager {
         // Capture stdout logs
         if let Some(stdout) = child.stdout.take() {
             let logs = self.logs.clone();
+            let log_path = self.log_path.clone();
             let app_clone = app.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     crate::traffic_monitor::parse_and_emit_traffic(app_clone.as_ref(), &line);
+                    append_core_log(&log_path, &line).await;
                     let mut logs = logs.lock().await;
                     logs.push(line);
-                    if logs.len() > 500 {
-                        logs.drain(0..100);
+                    if logs.len() > MAX_CORE_LOG_LINES {
+                        let drain_count = logs.len() - MAX_CORE_LOG_LINES;
+                        logs.drain(0..drain_count);
                     }
                 }
             });
@@ -83,14 +92,18 @@ impl CoreManager {
         // Capture stderr logs
         if let Some(stderr) = child.stderr.take() {
             let logs = self.logs.clone();
+            let log_path = self.log_path.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let line = format!("[ERR] {}", line);
+                    append_core_log(&log_path, &line).await;
                     let mut logs = logs.lock().await;
-                    logs.push(format!("[ERR] {}", line));
-                    if logs.len() > 500 {
-                        logs.drain(0..100);
+                    logs.push(line);
+                    if logs.len() > MAX_CORE_LOG_LINES {
+                        let drain_count = logs.len() - MAX_CORE_LOG_LINES;
+                        logs.drain(0..drain_count);
                     }
                 }
             });
@@ -116,6 +129,47 @@ impl CoreManager {
 
         Ok("内核已启动".to_string())
     }
+
+    #[cfg(unix)]
+    async fn stop_stale_cores(&self, core_path: &str, config_path: &str) {
+        let Ok(output) = Command::new("pgrep").arg("-f").arg(core_path).output().await else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+
+        let current_pid = std::process::id();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for pid in stdout.lines().filter_map(|line| line.trim().parse::<u32>().ok()) {
+            if pid == current_pid {
+                continue;
+            }
+
+            let Ok(args_output) = Command::new("ps")
+                .arg("-p")
+                .arg(pid.to_string())
+                .arg("-o")
+                .arg("args=")
+                .output()
+                .await
+            else {
+                continue;
+            };
+            let args = String::from_utf8_lossy(&args_output.stdout);
+            if args.contains(core_path) && args.contains(config_path) {
+                append_core_log(
+                    &self.log_path,
+                    &format!("[Info] 停止残留内核进程 PID {}", pid),
+                )
+                .await;
+                let _ = Command::new("kill").arg(pid.to_string()).output().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn stop_stale_cores(&self, _core_path: &str, _config_path: &str) {}
 
     /// Stop the running core
     pub async fn stop(&self) -> Result<String, String> {
@@ -147,8 +201,10 @@ impl CoreManager {
                 }
                 Ok(None) => true,
                 Err(e) => {
+                    let line = format!("[ERR] 检查内核状态失败：{}", e);
+                    append_core_log(&self.log_path, &line).await;
                     let mut logs = self.logs.lock().await;
-                    logs.push(format!("[ERR] 检查内核状态失败：{}", e));
+                    logs.push(line);
                     false
                 }
             }
@@ -171,13 +227,27 @@ impl CoreManager {
 
     /// Get recent logs
     pub async fn get_logs(&self, count: usize) -> Vec<String> {
-        let logs = self.logs.lock().await;
-        let start = if logs.len() > count {
-            logs.len() - count
-        } else {
-            0
-        };
-        logs[start..].to_vec()
+        match tokio::fs::read_to_string(&self.log_path).await {
+            Ok(text) => tail_lines(&text, count),
+            Err(_) => {
+                let logs = self.logs.lock().await;
+                let start = if logs.len() > count {
+                    logs.len() - count
+                } else {
+                    0
+                };
+                logs[start..].to_vec()
+            }
+        }
+    }
+
+    pub async fn clear_logs(&self) -> Result<(), String> {
+        self.logs.lock().await.clear();
+        match tokio::fs::remove_file(&self.log_path).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("清空内核日志失败：{}", e)),
+        }
     }
 
     /// Test config file validity
@@ -301,6 +371,9 @@ pub async fn download_xray(download_url: &str, install_dir: &str) -> Result<Stri
         let cursor = Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("解压失败：{}", e))?;
 
+        let mut binary_path: Option<String> = None;
+        let data_files = ["geoip.dat", "geosite.dat"];
+
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
             if file.name() == xray_binary {
@@ -318,10 +391,17 @@ pub async fn download_xray(download_url: &str, install_dir: &str) -> Result<Stri
                         .map_err(|e| format!("设置权限失败：{}", e))?;
                 }
 
-                return Ok(out_path);
+                binary_path = Some(out_path);
+            } else if data_files.contains(&file.name()) {
+                let out_path = format!("{}/{}", install_dir, file.name());
+                let mut out_file =
+                    std::fs::File::create(&out_path).map_err(|e| format!("创建数据文件失败：{}", e))?;
+                std::io::copy(&mut file, &mut out_file)
+                    .map_err(|e| format!("写入数据文件失败：{}", e))?;
             }
         }
-        Err("压缩包中未找到 xray 可执行文件".to_string())
+
+        binary_path.ok_or_else(|| "压缩包中未找到 xray 可执行文件".to_string())
     })
     .await
     .map_err(|e| format!("解压线程错误：{}", e))??;
@@ -489,4 +569,44 @@ fn get_platform_asset_name() -> String {
     // Xray release assets use the same `Xray-{os}-{arch}.zip` naming
     // on all three platforms (see https://github.com/XTLS/Xray-core/releases).
     format!("Xray-{}-{}.zip", os, arch)
+}
+
+fn core_log_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("logs")
+        .join("core.log")
+}
+
+fn load_recent_core_logs(path: &Path, count: usize) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => tail_lines(&text, count),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn tail_lines(text: &str, count: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    if lines.len() > count {
+        lines.drain(0..lines.len() - count);
+    }
+    lines
+}
+
+async fn append_core_log(path: &Path, line: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = file.write_all(line.as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
+    }
 }

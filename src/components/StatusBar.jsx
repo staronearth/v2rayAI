@@ -16,7 +16,9 @@ export default function StatusBar({ connectionStatus, activeServer, settings }) 
       <div className="status-bar-right">
         <div className="status-item">
           <span>🔌</span>
-          <span>HTTP: {settings.httpPort} | SOCKS: {settings.socksPort}</span>
+          <span>
+            {settings.allowLan ? 'LAN ' : ''}HTTP: {settings.httpPort} | SOCKS: {settings.socksPort}
+          </span>
         </div>
         <div className="status-item">
           <span>🛡️</span>

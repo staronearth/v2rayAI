@@ -24,13 +24,29 @@ pub struct ServerConfig {
     pub reality_public_key: Option<String>,
     pub reality_short_id: Option<String>,
     pub fingerprint: Option<String>,
+    pub allow_insecure: Option<bool>,
 }
 
 impl ServerConfig {
     /// Generate a full v2ray/xray config JSON from this server config
     pub fn to_v2ray_config(&self, http_port: u16, socks_port: u16, routing_mode: &str) -> Value {
+        self.to_v2ray_config_with_listen(http_port, socks_port, routing_mode, "127.0.0.1")
+    }
+
+    pub fn to_v2ray_config_with_listen(
+        &self,
+        http_port: u16,
+        socks_port: u16,
+        routing_mode: &str,
+        listen_host: &str,
+    ) -> Value {
         let outbound = self.to_outbound();
         let routing = Self::build_routing(routing_mode);
+        let listen_host = if listen_host.trim().is_empty() {
+            "127.0.0.1"
+        } else {
+            listen_host.trim()
+        };
 
         serde_json::json!({
             "log": { 
@@ -39,15 +55,8 @@ impl ServerConfig {
             },
             "dns": {
                 "servers": [
-                    {
-                        "address": "https://dns.google/dns-query",
-                        "domains": ["geosite:geolocation-!cn"]
-                    },
-                    {
-                        "address": "223.5.5.5",
-                        "domains": ["geosite:cn"],
-                        "expectIPs": ["geoip:cn"]
-                    },
+                    "https://dns.google/dns-query",
+                    "223.5.5.5",
                     "localhost"
                 ]
             },
@@ -56,14 +65,14 @@ impl ServerConfig {
                 {
                     "tag": "http-in",
                     "protocol": "http",
-                    "listen": "127.0.0.1",
+                    "listen": listen_host,
                     "port": http_port,
                     "settings": {}
                 },
                 {
                     "tag": "socks-in",
                     "protocol": "socks",
-                    "listen": "127.0.0.1",
+                    "listen": listen_host,
                     "port": socks_port,
                     "settings": { "udp": true }
                 }
@@ -111,8 +120,8 @@ impl ServerConfig {
         let mut user: serde_json::Map<String, Value> = serde_json::Map::new();
         user.insert("id".into(), Value::String(self.uuid.clone().unwrap_or_default()));
         user.insert("encryption".into(), Value::String(self.encryption.clone().unwrap_or_else(|| "none".into())));
-        if let Some(flow) = &self.flow {
-            user.insert("flow".into(), Value::String(flow.clone()));
+        if let Some(flow) = non_empty_option(self.flow.as_deref()) {
+            user.insert("flow".into(), Value::String(flow.to_string()));
         }
 
         serde_json::json!({
@@ -161,8 +170,8 @@ impl ServerConfig {
     }
 
     fn build_stream_settings(&self) -> Value {
-        let network = self.network.as_deref().unwrap_or("tcp");
-        let security = self.security.as_deref().unwrap_or("none");
+        let network = non_empty_option(self.network.as_deref()).unwrap_or("tcp");
+        let security = non_empty_option(self.security.as_deref()).unwrap_or("none");
 
         let mut stream: serde_json::Map<String, Value> = serde_json::Map::new();
         stream.insert("network".into(), Value::String(network.into()));
@@ -172,20 +181,20 @@ impl ServerConfig {
         match network {
             "ws" => {
                 let mut ws: serde_json::Map<String, Value> = serde_json::Map::new();
-                if let Some(path) = &self.path {
-                    ws.insert("path".into(), Value::String(path.clone()));
+                if let Some(path) = non_empty_option(self.path.as_deref()) {
+                    ws.insert("path".into(), Value::String(path.to_string()));
                 }
-                if let Some(host) = &self.host {
+                if let Some(host) = non_empty_option(self.host.as_deref()) {
                     let mut headers: serde_json::Map<String, Value> = serde_json::Map::new();
-                    headers.insert("Host".into(), Value::String(host.clone()));
+                    headers.insert("Host".into(), Value::String(host.to_string()));
                     ws.insert("headers".into(), Value::Object(headers));
                 }
                 stream.insert("wsSettings".into(), Value::Object(ws));
             }
             "grpc" => {
                 let mut grpc: serde_json::Map<String, Value> = serde_json::Map::new();
-                if let Some(path) = &self.path {
-                    grpc.insert("serviceName".into(), Value::String(path.clone()));
+                if let Some(path) = non_empty_option(self.path.as_deref()) {
+                    grpc.insert("serviceName".into(), Value::String(path.to_string()));
                 }
                 stream.insert("grpcSettings".into(), Value::Object(grpc));
             }
@@ -196,27 +205,30 @@ impl ServerConfig {
         match security {
             "tls" => {
                 let mut tls: serde_json::Map<String, Value> = serde_json::Map::new();
-                if let Some(sni) = &self.sni {
-                    tls.insert("serverName".into(), Value::String(sni.clone()));
+                if let Some(sni) = non_empty_option(self.sni.as_deref()) {
+                    tls.insert("serverName".into(), Value::String(sni.to_string()));
                 }
-                if let Some(fp) = &self.fingerprint {
-                    tls.insert("fingerprint".into(), Value::String(fp.clone()));
+                if let Some(fp) = non_empty_option(self.fingerprint.as_deref()) {
+                    tls.insert("fingerprint".into(), Value::String(fp.to_string()));
+                }
+                if self.allow_insecure == Some(true) {
+                    tls.insert("allowInsecure".into(), Value::Bool(true));
                 }
                 stream.insert("tlsSettings".into(), Value::Object(tls));
             }
             "reality" => {
                 let mut reality: serde_json::Map<String, Value> = serde_json::Map::new();
-                if let Some(sni) = &self.sni {
-                    reality.insert("serverName".into(), Value::String(sni.clone()));
+                if let Some(sni) = non_empty_option(self.sni.as_deref()) {
+                    reality.insert("serverName".into(), Value::String(sni.to_string()));
                 }
-                if let Some(fp) = &self.fingerprint {
-                    reality.insert("fingerprint".into(), Value::String(fp.clone()));
+                if let Some(fp) = non_empty_option(self.fingerprint.as_deref()) {
+                    reality.insert("fingerprint".into(), Value::String(fp.to_string()));
                 }
-                if let Some(pk) = &self.reality_public_key {
-                    reality.insert("publicKey".into(), Value::String(pk.clone()));
+                if let Some(pk) = non_empty_option(self.reality_public_key.as_deref()) {
+                    reality.insert("publicKey".into(), Value::String(pk.to_string()));
                 }
-                if let Some(sid) = &self.reality_short_id {
-                    reality.insert("shortId".into(), Value::String(sid.clone()));
+                if let Some(sid) = non_empty_option(self.reality_short_id.as_deref()) {
+                    reality.insert("shortId".into(), Value::String(sid.to_string()));
                 }
                 stream.insert("realitySettings".into(), Value::Object(reality));
             }
@@ -241,15 +253,60 @@ impl ServerConfig {
                 }]
             }),
             _ => serde_json::json!({
-                "domainStrategy": "IPIfNonMatch",
+                "domainStrategy": "AsIs",
                 "rules": [
-                    { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
-                    { "type": "field", "domain": ["geosite:cn"], "outboundTag": "direct" },
-                    { "type": "field", "ip": ["geoip:cn", "geoip:private"], "outboundTag": "direct" }
+                    {
+                        "type": "field",
+                        "ip": [
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "127.0.0.0/8",
+                            "169.254.0.0/16",
+                            "fc00::/7",
+                            "fe80::/10",
+                            "::1/128"
+                        ],
+                        "outboundTag": "direct"
+                    }
                 ]
             }),
         }
     }
+}
+
+fn non_empty_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn param(params: &std::collections::HashMap<String, String>, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+fn bool_param(params: &std::collections::HashMap<String, String>, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        params.get(*key).and_then(|value| {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            }
+        })
+    })
+}
+
+fn json_bool(value: &Value) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value.as_str().and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        })
+    })
 }
 
 /// Parse a proxy share link (vmess://, vless://, trojan://, ss://)
@@ -307,6 +364,7 @@ fn parse_vmess_link(link: &str) -> Result<ServerConfig, String> {
         reality_public_key: None,
         reality_short_id: None,
         fingerprint: None,
+        allow_insecure: json_bool(&v["allowInsecure"]).or_else(|| json_bool(&v["allowinsecure"])),
     })
 }
 
@@ -330,16 +388,20 @@ fn parse_vless_link(link: &str) -> Result<ServerConfig, String> {
         uuid: Some(url.username().to_string()),
         password: None,
         alter_id: None,
-        encryption: params.get("encryption").cloned(),
-        flow: params.get("flow").cloned(),
-        network: params.get("type").cloned(),
-        security: params.get("security").cloned(),
-        sni: params.get("sni").cloned().or_else(|| params.get("servername").cloned()),
-        path: params.get("path").cloned(),
-        host: params.get("host").cloned(),
-        reality_public_key: params.get("pbk").cloned(),
-        reality_short_id: params.get("sid").cloned(),
-        fingerprint: params.get("fp").cloned(),
+        encryption: param(&params, "encryption"),
+        flow: param(&params, "flow"),
+        network: param(&params, "type"),
+        security: param(&params, "security"),
+        sni: param(&params, "sni").or_else(|| param(&params, "servername")),
+        path: param(&params, "path"),
+        host: param(&params, "host"),
+        reality_public_key: param(&params, "pbk"),
+        reality_short_id: param(&params, "sid"),
+        fingerprint: param(&params, "fp"),
+        allow_insecure: bool_param(
+            &params,
+            &["allowInsecure", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify"],
+        ),
     })
 }
 
@@ -364,14 +426,18 @@ fn parse_trojan_link(link: &str) -> Result<ServerConfig, String> {
         alter_id: None,
         encryption: None,
         flow: None,
-        network: params.get("type").cloned(),
-        security: params.get("security").cloned().or(Some("tls".into())),
-        sni: params.get("sni").cloned(),
-        path: params.get("path").cloned(),
-        host: params.get("host").cloned(),
+        network: param(&params, "type"),
+        security: param(&params, "security").or(Some("tls".into())),
+        sni: param(&params, "sni").or_else(|| param(&params, "peer")),
+        path: param(&params, "path"),
+        host: param(&params, "host"),
         reality_public_key: None,
         reality_short_id: None,
-        fingerprint: params.get("fp").cloned(),
+        fingerprint: param(&params, "fp"),
+        allow_insecure: bool_param(
+            &params,
+            &["allowInsecure", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify"],
+        ),
     })
 }
 
@@ -390,13 +456,14 @@ fn parse_ss_link(link: &str) -> Result<ServerConfig, String> {
         let server_part = &main_part[at_pos + 1..];
 
         let clean_encoded = encoded.replace(&['\n', '\r', ' ', '\t'][..], "");
-        let decoded = base64::engine::general_purpose::STANDARD
+        let method_pass = base64::engine::general_purpose::STANDARD
             .decode(&clean_encoded)
             .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&clean_encoded))
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&clean_encoded))
             .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&clean_encoded))
-            .map_err(|e| format!("Base64 decode failed: {}", e))?;
-        let method_pass = String::from_utf8(decoded).map_err(|e| format!("UTF-8 error: {}", e))?;
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .unwrap_or_else(|| urlencoding_decode(encoded));
 
         let (method, password) = method_pass.split_once(':')
             .ok_or("Invalid ss format: missing ':'".to_string())?;
@@ -422,6 +489,7 @@ fn parse_ss_link(link: &str) -> Result<ServerConfig, String> {
             reality_public_key: None,
             reality_short_id: None,
             fingerprint: None,
+            allow_insecure: None,
         })
     } else {
         Err("Invalid shadowsocks link format".to_string())
@@ -546,6 +614,22 @@ mod tests {
     }
 
     #[test]
+    fn test_vmess_allow_insecure_string() {
+        let json = serde_json::json!({
+            "v": "2", "ps": "vmess-insecure",
+            "add": "vmess.example.com", "port": "443",
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "aid": "0", "scy": "auto", "net": "tcp",
+            "tls": "tls", "sni": "vmess.example.com",
+            "allowInsecure": "true"
+        });
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json.to_string());
+        let link = format!("vmess://{}", encoded);
+        let node = parse_share_link(&link).unwrap();
+        assert_eq!(node.allow_insecure, Some(true));
+    }
+
+    #[test]
     fn test_vmess_invalid_base64() {
         let link = "vmess://not-valid-base64!!!";
         let result = parse_share_link(link);
@@ -587,6 +671,26 @@ mod tests {
     }
 
     #[test]
+    fn test_vless_empty_query_params_are_ignored() {
+        let link = "vless://uuid-test@reality.example.com:443?\
+            encryption=none&flow=&security=reality&sni=&fp=&pbk=AAABBBCCCDDD&sid=&type=tcp#REALITY节点";
+        let node = parse_share_link(link).unwrap();
+        assert_eq!(node.flow, None);
+        assert_eq!(node.sni, None);
+        assert_eq!(node.fingerprint, None);
+        assert_eq!(node.reality_short_id, None);
+
+        let config = node.to_v2ray_config(10808, 10809, "global");
+        let user = &config["outbounds"][0]["settings"]["vnext"][0]["users"][0];
+        assert!(user.get("flow").is_none());
+        let reality = &config["outbounds"][0]["streamSettings"]["realitySettings"];
+        assert!(reality.get("serverName").is_none());
+        assert!(reality.get("fingerprint").is_none());
+        assert!(reality.get("shortId").is_none());
+        assert_eq!(reality["publicKey"], "AAABBBCCCDDD");
+    }
+
+    #[test]
     fn test_vless_websocket() {
         let link = "vless://test-uuid@ws.example.com:443?encryption=none&security=tls&sni=ws.example.com&type=ws&host=ws.example.com&path=%2Fvless-ws#WS节点";
         let node = parse_share_link(link).unwrap();
@@ -613,6 +717,19 @@ mod tests {
     }
 
     #[test]
+    fn test_trojan_allow_insecure() {
+        let link = "trojan://my-password@trojan.example.com:443?security=tls&allowInsecure=1#Trojan节点";
+        let node = parse_share_link(link).unwrap();
+        assert_eq!(node.allow_insecure, Some(true));
+
+        let config = node.to_v2ray_config(10808, 10809, "global");
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["tlsSettings"]["allowInsecure"],
+            true
+        );
+    }
+
+    #[test]
     fn test_trojan_websocket() {
         let link = "trojan://pass123@ws-trojan.com:443?type=ws&security=tls&path=%2Ftrojan-ws&sni=ws-trojan.com#Trojan-WS";
         let node = parse_share_link(link).unwrap();
@@ -630,6 +747,18 @@ mod tests {
         let method_pass = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:my-secret-password");
         let link = format!("ss://{}@ss.example.com:8388#SS节点", method_pass);
         let node = parse_share_link(&link).unwrap();
+        assert_eq!(node.protocol, "shadowsocks");
+        assert_eq!(node.name, "SS节点");
+        assert_eq!(node.address, "ss.example.com");
+        assert_eq!(node.port, 8388);
+        assert_eq!(node.encryption.as_deref(), Some("aes-256-gcm"));
+        assert_eq!(node.password.as_deref(), Some("my-secret-password"));
+    }
+
+    #[test]
+    fn test_ss_sip002_plain_userinfo_format() {
+        let link = "ss://aes-256-gcm:my-secret-password@ss.example.com:8388#SS节点";
+        let node = parse_share_link(link).unwrap();
         assert_eq!(node.protocol, "shadowsocks");
         assert_eq!(node.name, "SS节点");
         assert_eq!(node.address, "ss.example.com");
@@ -735,6 +864,7 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
             reality_public_key: None,
             reality_short_id: None,
             fingerprint: Some("chrome".to_string()),
+            allow_insecure: None,
         }
     }
 
@@ -765,6 +895,27 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
         assert_eq!(outbounds[0]["tag"], "proxy");
         assert_eq!(outbounds[1]["protocol"], "freedom");
         assert_eq!(outbounds[2]["protocol"], "blackhole");
+    }
+
+    #[test]
+    fn test_generated_config_does_not_require_geo_data_files() {
+        let server = make_test_server("vless");
+        let config = server.to_v2ray_config(10808, 10809, "rule");
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(!text.contains("geosite:"));
+        assert!(!text.contains("geoip:"));
+    }
+
+    #[test]
+    fn test_generated_config_can_listen_on_lan() {
+        let server = make_test_server("vless");
+        let local_config = server.to_v2ray_config(10808, 10809, "rule");
+        assert_eq!(local_config["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(local_config["inbounds"][1]["listen"], "127.0.0.1");
+
+        let lan_config = server.to_v2ray_config_with_listen(10808, 10809, "rule", "0.0.0.0");
+        assert_eq!(lan_config["inbounds"][0]["listen"], "0.0.0.0");
+        assert_eq!(lan_config["inbounds"][1]["listen"], "0.0.0.0");
     }
 
     #[test]
@@ -806,11 +957,9 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
     fn test_routing_rule_mode() {
         let routing = ServerConfig::build_routing("rule");
         let rules = routing["rules"].as_array().unwrap();
-        assert!(rules.len() >= 3); // ads block, cn direct, cn ip direct
-        // Check ad blocking rule
-        assert_eq!(rules[0]["outboundTag"], "block");
-        // Check CN direct rules
-        assert_eq!(rules[1]["outboundTag"], "direct");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["outboundTag"], "direct");
+        assert!(rules[0]["ip"].as_array().unwrap().contains(&serde_json::json!("192.168.0.0/16")));
     }
 
     #[test]
