@@ -1,4 +1,6 @@
+mod agent;
 mod ai_service;
+mod app_logger;
 mod chat_history;
 mod config_generator;
 mod config_manager;
@@ -8,33 +10,33 @@ mod knowledge_base;
 mod secure_store;
 mod sub_converter;
 mod sys_proxy;
-mod app_logger;
 mod traffic_monitor;
 
+use agent::AgentResult;
 use ai_service::{AiService, ChatMessage};
 use app_logger::LogEntry;
 use chat_history::{
-    Conversation, ConversationMeta,
-    save_conversation, load_conversation,
-    list_conversations, delete_conversation, search_conversations, auto_title,
-    search_history_rag, format_history_rag_context,
+    auto_title, delete_conversation, format_history_rag_context, list_conversations,
+    load_conversation, save_conversation, search_conversations, search_history_rag, Conversation,
+    ConversationMeta,
 };
 use config_generator::{parse_share_link, parse_subscription, ServerConfig};
 use config_manager::{ConfigManager, SavedConfig};
-use core_manager::{CoreManager, fetch_latest_xray_release, download_xray, find_xray_core, resolve_or_download_core, CoreResolveResult};
-use health_monitor::{HealthMonitor, LatencyResult, full_latency_test};
+use core_manager::{
+    download_xray, fetch_latest_xray_release, find_xray_core, resolve_or_download_core,
+    CoreManager, CoreResolveResult,
+};
+use health_monitor::{full_latency_test, HealthMonitor, LatencyResult};
 use knowledge_base::KnowledgeBase;
-use regex::Regex;
-use sub_converter::SubConverterManager;
-use sys_proxy::{enable_system_proxy, disable_system_proxy, ProxySettings};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use sub_converter::SubConverterManager;
+use sys_proxy::{disable_system_proxy, enable_system_proxy, ProxySettings};
 use tauri::State;
 use tokio::sync::Mutex;
 
 static APP_LOGGER: std::sync::OnceLock<&'static app_logger::AppLogger> = std::sync::OnceLock::new();
 
-/// Application state shared across Tauri commands
 pub struct AppState {
     pub ai_service: AiService,
     pub core_manager: Arc<CoreManager>,
@@ -44,9 +46,7 @@ pub struct AppState {
     pub sub_converter: Arc<SubConverterManager>,
 }
 
-// ============================================================
-// App Logger Commands
-// ============================================================
+// ── App Logger ────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_app_logs(count: usize, level_filter: Option<String>) -> Vec<LogEntry> {
@@ -84,9 +84,7 @@ async fn clear_core_logs(state: State<'_, AppState>) -> Result<(), String> {
     state.core_manager.clear_logs().await
 }
 
-// ============================================================
-// Chat History Commands
-// ============================================================
+// ── Chat History ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn save_chat(conv: Conversation) -> Result<(), String> {
@@ -115,20 +113,18 @@ async fn search_chats(query: String) -> Result<Vec<ConversationMeta>, String> {
 
 #[tauri::command]
 fn generate_conv_title(messages: Vec<ChatMessage>) -> String {
-    // Convert ai_service::ChatMessage to chat_history::ChatMessage for title gen
-    let hist_msgs: Vec<chat_history::ChatMessage> = messages.iter().map(|m| {
-        chat_history::ChatMessage {
+    let hist_msgs: Vec<chat_history::ChatMessage> = messages
+        .iter()
+        .map(|m| chat_history::ChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
             timestamp: 0,
-        }
-    }).collect();
+        })
+        .collect();
     auto_title(&hist_msgs)
 }
 
-// ============================================================
-// AI Chat Commands (with RAG + Tool Execution Loop)
-// ============================================================
+// ── AI Chat (harness-agent) ───────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AiSettings {
@@ -175,218 +171,114 @@ pub struct SubscriptionContext {
     pub updated_at: Option<i64>,
 }
 
-/// Result of a tool execution: text description for the AI + optional parsed servers.
-struct ToolResult {
-    text: String,
-    servers: Vec<ServerConfig>,
-}
+/// Build the system message: static prompt + RAG context + local env snapshot.
+fn build_system_message(
+    doc_rag: &str,
+    hist_rag: &str,
+    context: &Option<ConnectionContext>,
+) -> String {
+    let mut sys = agent::system_prompt().to_string();
 
-const ALLOWED_AGENT_TOOLS: &[&str] = &[
-    "fetch_subscription",
-    "convert_subscription",
-    "subconverter_status",
-    "parse_proxy_links",
-];
-
-/// Parse `[[TOOL:tool_name(args)]]` markers from AI response text.
-/// Returns a list of (tool_name, args) tuples.
-/// Uses `[\s\S]*?` to match args across newlines (e.g. proxy links) and allows empty args.
-fn parse_tool_calls(text: &str) -> Vec<(String, String)> {
-    let re = Regex::new(r"(?s)\[\[TOOL:(\w+)\((.*?)\)\]\]").unwrap();
-    re.captures_iter(text)
-        .map(|cap| (cap[1].to_string(), cap[2].to_string()))
-        .collect()
-}
-
-fn is_allowed_agent_tool(tool_name: &str) -> bool {
-    ALLOWED_AGENT_TOOLS.contains(&tool_name)
-}
-
-/// Execute a single tool call and return text result + any parsed servers.
-async fn execute_tool(
-    tool_name: &str,
-    args: &str,
-    sub_converter: &SubConverterManager,
-) -> ToolResult {
-    match tool_name {
-        "fetch_subscription" => {
-            let url = args.trim();
-            if url.is_empty() {
-                return ToolResult { text: "错误：未提供订阅 URL".into(), servers: vec![] };
-            }
-            // Fetch subscription content — use no_proxy to bypass local proxy
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent("v2rayN/6.31")
-                .no_proxy()
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => return ToolResult {
-                    text: format!("错误：构建 HTTP 客户端失败：{}", e),
-                    servers: vec![],
-                },
-            };
-
-            let content = match client.get(url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.text().await {
-                        Ok(t) => t,
-                        Err(e) => return ToolResult {
-                            text: format!("错误：读取订阅内容失败：{}", e),
-                            servers: vec![],
-                        },
-                    }
-                }
-                Ok(resp) => return ToolResult {
-                    text: format!("错误：订阅返回 HTTP {}。如果该订阅需要直连访问，请确保关闭代理后重试", resp.status()),
-                    servers: vec![],
-                },
-                Err(e) => return ToolResult {
-                    text: format!("错误：获取订阅失败：{}", e),
-                    servers: vec![],
-                },
-            };
-
-            let servers = parse_subscription(&content);
-            if servers.is_empty() {
-                // Try subconverter fallback
-                match sub_converter.convert_subscription(url).await {
-                    Ok(converted) => {
-                        let converted_servers = parse_subscription(&converted);
-                        if converted_servers.is_empty() {
-                            ToolResult {
-                                text: "获取成功但未解析出任何节点，内容可能不是标准代理订阅格式".into(),
-                                servers: vec![],
-                            }
-                        } else {
-                            let text = format_servers_result(&converted_servers);
-                            ToolResult { text, servers: converted_servers }
-                        }
-                    }
-                    Err(_) => ToolResult {
-                        text: "内置解析器未能解析订阅内容，subconverter 未运行。建议用户先在工具箱页面启动 subconverter".into(),
-                        servers: vec![],
-                    },
-                }
-            } else {
-                let text = format_servers_result(&servers);
-                ToolResult { text, servers }
-            }
-        }
-
-        "convert_subscription" => {
-            let url = args.trim();
-            if url.is_empty() {
-                return ToolResult { text: "错误：未提供订阅 URL".into(), servers: vec![] };
-            }
-            match sub_converter.convert_subscription(url).await {
-                Ok(converted) => {
-                    let servers = parse_subscription(&converted);
-                    if servers.is_empty() {
-                        ToolResult {
-                            text: "subconverter 转换完成但未解析出可用节点".into(),
-                            servers: vec![],
-                        }
-                    } else {
-                        let text = format_servers_result(&servers);
-                        ToolResult { text, servers }
-                    }
-                }
-                Err(e) => ToolResult {
-                    text: format!("subconverter 转换失败：{}", e),
-                    servers: vec![],
-                },
-            }
-        }
-
-        "subconverter_status" => {
-            let status = sub_converter.status().await;
-            ToolResult {
-                text: format!(
-                    "已安装: {} | 运行中: {} | 路径: {}",
-                    if status.installed { "✅ 是" } else { "❌ 否" },
-                    if status.running { "🟢 是" } else { "⏹ 否" },
-                    status.path.unwrap_or_else(|| "无".to_string()),
-                ),
-                servers: vec![],
-            }
-        }
-
-        "parse_proxy_links" => {
-            let links_text = args.trim();
-            if links_text.is_empty() {
-                return ToolResult { text: "错误：未提供代理链接".into(), servers: vec![] };
-            }
-            let mut all_servers: Vec<ServerConfig> = Vec::new();
-            let mut errors: Vec<String> = Vec::new();
-
-            for link in links_text.split(|c: char| c == '\n' || c == ' ') {
-                let link = link.trim();
-                if link.is_empty() { continue; }
-                match parse_share_link(link) {
-                    Ok(server) => all_servers.push(server),
-                    Err(e) => errors.push(format!("解析失败 `{}...`: {}",
-                        &link[..link.len().min(30)], e)),
-                }
-            }
-
-            let mut result = String::new();
-            if !all_servers.is_empty() {
-                result.push_str(&format_servers_result(&all_servers));
-            }
-            if !errors.is_empty() {
-                if !result.is_empty() { result.push_str("\n"); }
-                result.push_str(&format!("解析错误 ({}):\n{}",
-                    errors.len(), errors.join("\n")));
-            }
-            if result.is_empty() {
-                ToolResult { text: "未找到任何可解析的代理链接".into(), servers: vec![] }
-            } else {
-                let servers = all_servers;
-                ToolResult { text: result, servers }
-            }
-        }
-
-        _ => ToolResult { text: format!("未知工具：{}", tool_name), servers: vec![] },
+    // doc_rag / hist_rag already include section headers produced by
+    // get_rag_context() / format_history_rag_context() — append directly.
+    if !doc_rag.is_empty() {
+        sys.push_str(doc_rag);
     }
-}
-
-/// Format a list of parsed servers into a summary string for the AI context.
-fn format_servers_result(servers: &[ServerConfig]) -> String {
-    let mut result = format!("成功解析 {} 个节点：\n", servers.len());
-    for (i, s) in servers.iter().enumerate() {
-        result.push_str(&format!(
-            "{}. [{}] {} — {}:{}\n",
-            i + 1,
-            s.protocol.to_uppercase(),
-            s.name,
-            s.address,
-            s.port,
-        ));
-        if i >= 19 && servers.len() > 20 {
-            result.push_str(&format!("... 还有 {} 个节点\n", servers.len() - 20));
-            break;
-        }
+    if !hist_rag.is_empty() {
+        sys.push_str(hist_rag);
     }
-    result
+
+    if let Some(ctx) = context {
+        sys.push_str(&build_env_snapshot(ctx));
+    }
+
+    sys
 }
 
-/// Strip tool call markers from the AI response text.
-fn strip_tool_markers(text: &str) -> String {
-    let re = Regex::new(r"(?s)\[\[TOOL:(\w+)\(.*?\)\]\]").unwrap();
-    re.replace_all(text, "🔧 *正在调用工具 `$1`...*").to_string()
-}
+fn build_env_snapshot(ctx: &ConnectionContext) -> String {
+    let server_lines: Vec<String> = ctx
+        .servers
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .take(80)
+        .enumerate()
+        .map(|(idx, s)| {
+            format!(
+                "{}. {}{} [{}] {}:{} | 来源:{}{}{}{}",
+                idx + 1,
+                if s.is_active.unwrap_or(false) {
+                    "* "
+                } else {
+                    ""
+                },
+                s.name.as_deref().unwrap_or("未命名"),
+                s.protocol.as_deref().unwrap_or("?").to_uppercase(),
+                s.address.as_deref().unwrap_or("?"),
+                s.port.unwrap_or(0),
+                s.source.as_deref().unwrap_or("?"),
+                s.sub_name
+                    .as_ref()
+                    .map(|v| format!(" | 订阅:{v}"))
+                    .unwrap_or_default(),
+                s.latency
+                    .as_ref()
+                    .map(|v| format!(" | 延迟:{v}"))
+                    .unwrap_or_default(),
+                if s.allow_insecure.unwrap_or(false) {
+                    " | allowInsecure:true"
+                } else {
+                    ""
+                },
+            )
+        })
+        .collect();
 
-/// Structured response from chat_with_ai: AI text + any servers parsed by tools.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatResult {
-    pub message: String,
-    pub parsed_servers: Vec<ServerConfig>,
-}
+    let sub_lines: Vec<String> = ctx
+        .subscriptions
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            format!(
+                "{}. {} | 节点:{}",
+                idx + 1,
+                s.name.as_deref().unwrap_or("未命名"),
+                s.node_count.unwrap_or(0),
+            )
+        })
+        .collect();
 
-const MAX_TOOL_LOOP_ITERATIONS: usize = 5;
+    format!(
+        "\n\n---\n## [本地环境快照]\n\
+        连接: {} | 当前节点: {} | 协议: {} | 延迟: {}ms\n\
+        代理端口: HTTP {} / SOCKS {} | LAN: {} | 路由: {}\n\
+        节点总数: {} | 订阅总数: {}\n\n\
+        **节点列表**\n{}\n\n\
+        **订阅列表**\n{}\n---",
+        ctx.is_connected,
+        ctx.server_name.as_deref().unwrap_or("无"),
+        ctx.protocol.as_deref().unwrap_or("无"),
+        ctx.latency_ms.unwrap_or(0),
+        ctx.http_port.unwrap_or(0),
+        ctx.socks_port.unwrap_or(0),
+        ctx.allow_lan.unwrap_or(false),
+        ctx.routing_mode.as_deref().unwrap_or("smart"),
+        ctx.server_count.unwrap_or(0),
+        ctx.subscription_count.unwrap_or(0),
+        if server_lines.is_empty() {
+            "无节点".to_string()
+        } else {
+            server_lines.join("\n")
+        },
+        if sub_lines.is_empty() {
+            "无订阅".to_string()
+        } else {
+            sub_lines.join("\n")
+        },
+    )
+}
 
 #[tauri::command]
 async fn chat_with_ai(
@@ -395,162 +287,46 @@ async fn chat_with_ai(
     settings: AiSettings,
     context: Option<ConnectionContext>,
     state: State<'_, AppState>,
-) -> Result<ChatResult, String> {
-    // ── Dual RAG: run document search and history search concurrently ──
-    let doc_rag_fut = async {
-        let kb = state.knowledge_base.lock().await;
-        kb.get_rag_context(&message, 4)
-    };
-    let hist_rag_fut = search_history_rag(&message, 3, 600);
-
-    let (doc_rag, hist_chunks) = tokio::join!(doc_rag_fut, hist_rag_fut);
+) -> Result<AgentResult, String> {
+    // ── Dual RAG: document search + history search (concurrent) ──────────────
+    let (doc_rag, hist_chunks) = tokio::join!(
+        async {
+            let kb = state.knowledge_base.lock().await;
+            kb.get_rag_context(&message, 4)
+        },
+        search_history_rag(&message, 3, 600),
+    );
     let hist_rag = format_history_rag_context(&hist_chunks);
 
-    // ── Build enriched message with clearly labelled RAG sections ──
-    let mut enriched = message.clone();
-    if !doc_rag.is_empty() {
-        enriched.push_str(&doc_rag);
-    }
-    if !hist_rag.is_empty() {
-        enriched.push_str(&hist_rag);
-    }
+    // ── Build system message with RAG + local env context ────────────────────
+    let system_content = build_system_message(&doc_rag, &hist_rag, &context);
 
-    // ── Inject current connection state and local app snapshot ──
-    if let Some(ctx) = context {
-        let mut server_lines = Vec::new();
-        if let Some(servers) = &ctx.servers {
-            for (idx, server) in servers.iter().take(80).enumerate() {
-                server_lines.push(format!(
-                    "{}. {}{} [{}] {}:{} | 来源:{}{}{}{}",
-                    idx + 1,
-                    if server.is_active.unwrap_or(false) { "*" } else { "" },
-                    server.name.as_deref().unwrap_or("未命名节点"),
-                    server.protocol.as_deref().unwrap_or("unknown").to_uppercase(),
-                    server.address.as_deref().unwrap_or("unknown"),
-                    server.port.unwrap_or(0),
-                    server.source.as_deref().unwrap_or("unknown"),
-                    server.sub_name.as_ref().map(|s| format!(" | 订阅:{}", s)).unwrap_or_default(),
-                    server.latency.as_ref().map(|s| format!(" | 延迟:{}", s)).unwrap_or_default(),
-                    if server.allow_insecure.unwrap_or(false) { " | allowInsecure:true" } else { "" },
-                ));
-            }
-        }
+    // ── Assemble the full message thread ─────────────────────────────────────
+    // [system] → [history turns] → [current user message]
+    let mut thread = Vec::with_capacity(history.len() + 2);
+    thread.push(ChatMessage {
+        role: "system".to_string(),
+        content: system_content,
+    });
+    thread.extend(history);
+    thread.push(ChatMessage {
+        role: "user".to_string(),
+        content: message,
+    });
 
-        let mut sub_lines = Vec::new();
-        if let Some(subscriptions) = &ctx.subscriptions {
-            for (idx, sub) in subscriptions.iter().enumerate() {
-                sub_lines.push(format!(
-                    "{}. {} | 节点:{}",
-                    idx + 1,
-                    sub.name.as_deref().unwrap_or("未命名订阅"),
-                    sub.node_count.unwrap_or(0),
-                ));
-            }
-        }
-
-        enriched.push_str(&format!(
-            "\n\n---\n**[本地环境快照]**\n连接: {} | 当前节点:{} | 协议:{} | 延迟:{}ms\n代理端口: HTTP {} / SOCKS {} | LAN开放:{} | 路由:{}\n节点总数:{} | 订阅总数:{}\n\n**[节点管理列表]**\n{}\n\n**[订阅列表]**\n{}",
-            ctx.is_connected,
-            ctx.server_name.unwrap_or("无".into()),
-            ctx.protocol.unwrap_or("无".into()),
-            ctx.latency_ms.unwrap_or(0),
-            ctx.http_port.unwrap_or(0),
-            ctx.socks_port.unwrap_or(0),
-            ctx.allow_lan.unwrap_or(false),
-            ctx.routing_mode.unwrap_or("smart".into()),
-            ctx.server_count.unwrap_or(0),
-            ctx.subscription_count.unwrap_or(0),
-            if server_lines.is_empty() { "无节点".to_string() } else { server_lines.join("\n") },
-            if sub_lines.is_empty() { "无订阅".to_string() } else { sub_lines.join("\n") },
-        ));
-    }
-
-    // ── Tool Execution Loop ──────────────────────────────────────────────
-    let sub_converter = state.sub_converter.clone();
-    let mut loop_history = history.clone();
-    let mut all_parsed_servers: Vec<ServerConfig> = Vec::new();
-
-    // First call uses the enriched message
-    let mut ai_response = state.ai_service
-        .chat(&settings.base_url, &settings.api_key, &settings.model, &enriched, &loop_history)
-        .await?;
-
-    for iteration in 0..MAX_TOOL_LOOP_ITERATIONS {
-        let tool_calls = parse_tool_calls(&ai_response);
-        if tool_calls.is_empty() {
-            break;
-        }
-
-        log::info!(
-            "[Tool Loop] Iteration {}: {} tool call(s) detected",
-            iteration + 1,
-            tool_calls.len()
-        );
-
-        let mut tool_results = String::new();
-        for (name, args) in &tool_calls {
-            if !is_allowed_agent_tool(name) {
-                log::warn!("[Agent Policy] Blocked non-allowlisted tool call: {}", name);
-                tool_results.push_str(&format!(
-                    "\n[[TOOL_RESULT:{}]]\n策略拦截：该工具不在当前 agent allowlist 中。允许的工具：{}\n[[/TOOL_RESULT]]\n",
-                    name,
-                    ALLOWED_AGENT_TOOLS.join(", ")
-                ));
-                continue;
-            }
-
-            log::info!("[Agent Audit] Tool call approved: {} ({} chars)", name, args.len());
-            let result = execute_tool(name, args, &sub_converter).await;
-            let parsed_count = result.servers.len();
-            // Collect servers from tool results
-            if !result.servers.is_empty() {
-                all_parsed_servers.extend(result.servers);
-            }
-            log::info!(
-                "[Agent Audit] Tool call completed: {} ({} parsed server(s))",
-                name,
-                parsed_count
-            );
-            tool_results.push_str(&format!(
-                "\n[[TOOL_RESULT:{}]]\n{}\n[[/TOOL_RESULT]]\n",
-                name, result.text
-            ));
-        }
-
-        loop_history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: ai_response.clone(),
-        });
-        loop_history.push(ChatMessage {
-            role: "user".to_string(),
-            content: format!(
-                "以下是工具执行结果，请根据结果给用户生成最终回答。不要再调用工具，直接回答用户。\n{}",
-                tool_results
-            ),
-        });
-
-        ai_response = state.ai_service
-            .chat(
-                &settings.base_url,
-                &settings.api_key,
-                &settings.model,
-                "请根据上面的工具执行结果回答",
-                &loop_history,
-            )
-            .await?;
-    }
-
-    let final_response = strip_tool_markers(&ai_response);
-
-    Ok(ChatResult {
-        message: final_response,
-        parsed_servers: all_parsed_servers,
-    })
+    // ── Run agentic loop ──────────────────────────────────────────────────────
+    agent::run(
+        &state.ai_service,
+        &settings.base_url,
+        &settings.api_key,
+        &settings.model,
+        thread,
+        &state.sub_converter,
+    )
+    .await
 }
 
-// ============================================================
-// History RAG Command (for frontend inspection / debugging)
-// ============================================================
+// ── History RAG Debug Command ─────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 pub struct HistoryRagResult {
@@ -577,9 +353,7 @@ async fn search_history_knowledge(
         .collect())
 }
 
-// ============================================================
-// Knowledge Base Commands
-// ============================================================
+// ── Knowledge Base ────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn refresh_knowledge_base(
@@ -601,18 +375,17 @@ async fn search_knowledge(
 ) -> Result<Vec<serde_json::Value>, String> {
     let kb = state.knowledge_base.lock().await;
     let chunks = kb.search(&query, top_k.unwrap_or(5));
-    let results: Vec<serde_json::Value> = chunks.iter().map(|c| serde_json::json!({
-        "id": c.id,
-        "title": c.title,
-        "source": c.source,
-        "content": c.content,
-    })).collect();
-    Ok(results)
+    Ok(chunks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id, "title": c.title, "source": c.source, "content": c.content,
+            })
+        })
+        .collect())
 }
 
-// ============================================================
-// Config Generation & Management Commands
-// ============================================================
+// ── Config Generation & Management ───────────────────────────────────────────
 
 #[tauri::command]
 fn parse_proxy_link(link: String) -> Result<ServerConfig, String> {
@@ -632,8 +405,12 @@ fn generate_config(
     routing_mode: String,
     allow_lan: Option<bool>,
 ) -> serde_json::Value {
-    let listen_host = if allow_lan.unwrap_or(false) { "0.0.0.0" } else { "127.0.0.1" };
-    server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen_host)
+    let listen = if allow_lan.unwrap_or(false) {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen)
 }
 
 #[tauri::command]
@@ -645,8 +422,12 @@ async fn apply_config(
     allow_lan: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let listen_host = if allow_lan.unwrap_or(false) { "0.0.0.0" } else { "127.0.0.1" };
-    let config = server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen_host);
+    let listen = if allow_lan.unwrap_or(false) {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    let config = server.to_v2ray_config_with_listen(http_port, socks_port, &routing_mode, listen);
     state.config_manager.write_active_config(&config).await
 }
 
@@ -673,9 +454,7 @@ async fn delete_saved_config(id: String, state: State<'_, AppState>) -> Result<(
     state.config_manager.delete_config(&id).await
 }
 
-// ============================================================
-// Core Management Commands
-// ============================================================
+// ── Core Management ───────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn start_core(
@@ -683,12 +462,14 @@ async fn start_core(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    // Use the active config file automatically
     let config_path = state.config_manager.active_config_path();
     if !std::path::Path::new(&config_path).exists() {
         return Err("请先连接一个节点以生成配置文件".to_string());
     }
-    state.core_manager.start(&core_path, &config_path, Some(app)).await
+    state
+        .core_manager
+        .start(&core_path, &config_path, Some(app))
+        .await
 }
 
 #[tauri::command]
@@ -712,14 +493,14 @@ async fn test_config(
     config_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    state.core_manager.test_config(&core_path, &config_path).await
+    state
+        .core_manager
+        .test_config(&core_path, &config_path)
+        .await
 }
 
 #[tauri::command]
-async fn get_core_version(
-    core_path: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn get_core_version(core_path: String, state: State<'_, AppState>) -> Result<String, String> {
     state.core_manager.get_version(&core_path).await
 }
 
@@ -729,10 +510,7 @@ async fn fetch_latest_xray() -> Result<core_manager::XrayRelease, String> {
 }
 
 #[tauri::command]
-async fn download_xray_core(
-    download_url: String,
-    install_dir: String,
-) -> Result<String, String> {
+async fn download_xray_core(download_url: String, install_dir: String) -> Result<String, String> {
     download_xray(&download_url, &install_dir).await
 }
 
@@ -741,21 +519,16 @@ async fn auto_detect_core() -> Result<String, String> {
     find_xray_core().await
 }
 
-/// Smart command: find existing core first, download if not found.
-/// Returns path + source ("existing" / "downloaded") + description.
 #[tauri::command]
 async fn resolve_core() -> Result<CoreResolveResult, String> {
     resolve_or_download_core().await
 }
 
-// ============================================================
-// System Proxy Commands
-// ============================================================
+// ── System Proxy ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn enable_proxy(http_port: u16, socks_port: u16) -> Result<String, String> {
-    let settings = ProxySettings::local(http_port, socks_port);
-    enable_system_proxy(&settings).await
+    enable_system_proxy(&ProxySettings::local(http_port, socks_port)).await
 }
 
 #[tauri::command]
@@ -763,9 +536,7 @@ async fn disable_proxy() -> Result<String, String> {
     disable_system_proxy().await
 }
 
-// ============================================================
-// Latency Test Commands
-// ============================================================
+// ── Latency & Health ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn test_latency(
@@ -795,96 +566,81 @@ async fn stop_health_monitor(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-// ============================================================
-// Subscription Commands
-// ============================================================
+// ── Subscription ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn fetch_subscription(
     url: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ServerConfig>, String> {
-    // Use a widely recognized v2ray client User-Agent so proxy panels return
-    // base64 configuration instead of a dashboard HTML page or Clash YAML.
-    // no_proxy() ensures we don't route through the local proxy we set up.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("v2rayN/6.31")
         .no_proxy()
         .build()
-        .map_err(|e| format!("构建请求客户端失败: {}", e))?;
+        .map_err(|e| format!("构建请求客户端失败: {e}"))?;
 
     let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("获取订阅失败：{}", e))?;
+        .map_err(|e| format!("获取订阅失败：{e}"))?;
 
     if !response.status().is_success() {
-        return Err(format!("订阅服务器返回 HTTP {}，请检查链接是否正确", response.status()));
+        return Err(format!(
+            "订阅服务器返回 HTTP {}，请检查链接是否正确",
+            response.status()
+        ));
     }
 
     let content = response
         .text()
         .await
-        .map_err(|e| format!("读取订阅内容失败：{}", e))?;
+        .map_err(|e| format!("读取订阅内容失败：{e}"))?;
 
-    // ── Try native parser first ────────────────────────────────────────────
     let servers = parse_subscription(&content);
     if !servers.is_empty() {
         return Ok(servers);
     }
 
-    // ── Native parse failed → try subconverter fallback ────────────────────
     log::info!("内置解析器未能解析订阅，尝试 subconverter 转换...");
     match state.sub_converter.convert_subscription(&url).await {
         Ok(converted_text) => {
-            let converted_servers = parse_subscription(&converted_text);
-            if !converted_servers.is_empty() {
-                log::info!("subconverter 成功转换 {} 个节点", converted_servers.len());
-                return Ok(converted_servers);
+            let servers = parse_subscription(&converted_text);
+            if !servers.is_empty() {
+                log::info!("subconverter 成功转换 {} 个节点", servers.len());
+                return Ok(servers);
             }
-            // subconverter returned something but we still couldn't parse it
-            let preview = if converted_text.len() > 100 {
-                format!("{}...", &converted_text[..100])
-            } else {
-                converted_text.clone()
-            };
+            let preview = converted_text
+                .get(..100)
+                .unwrap_or(&converted_text)
+                .replace('\n', " ");
             Err(format!(
-                "subconverter 已转换但仍无法解析节点。\n转换结果前缀: {}",
-                preview.replace('\n', " ")
+                "subconverter 已转换但仍无法解析节点。\n转换结果前缀: {preview}"
             ))
         }
         Err(converter_err) => {
-            // subconverter not available → give user a clear diagnosis
-            let preview = if content.len() > 100 {
-                format!("{}...", &content[..100])
-            } else {
-                content.clone()
-            };
+            let preview = content.get(..100).unwrap_or(&content).replace('\n', " ");
             let is_clash = content.trim_start().starts_with("proxies:")
                 || content.trim_start().starts_with("proxy-groups:")
                 || (content.contains("proxies:") && content.contains("server:"));
 
             if is_clash {
                 Err(format!(
-                    "检测到 Clash 格式订阅，内置解析器不支持此格式。\n请在「设置 → 订阅转换工具」中安装并启动 subconverter，即可自动转换。\n\nsubconverter 状态：{}",
-                    converter_err
+                    "检测到 Clash 格式订阅，内置解析器不支持此格式。\n\
+                    请在「工具箱」中安装并启动 subconverter 后重试。\n\nsubconverter 状态：{converter_err}"
                 ))
             } else {
                 Err(format!(
-                    "订阅解析结果为空，未发现支持的节点格式。\n获取到的内容前缀: {}\n\n如果是 Clash/Surge 专属格式，请安装订阅转换工具。\nsubconverter 状态：{}",
-                    preview.replace('\n', " "),
-                    converter_err
+                    "订阅解析结果为空，未发现支持的节点格式。\n\
+                    内容前缀: {preview}\n\nsubconverter 状态：{converter_err}"
                 ))
             }
         }
     }
 }
 
-// ============================================================
-// SubConverter Commands
-// ============================================================
+// ── SubConverter ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn install_subconverter(
@@ -895,16 +651,12 @@ async fn install_subconverter(
 }
 
 #[tauri::command]
-async fn start_subconverter(
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn start_subconverter(state: State<'_, AppState>) -> Result<String, String> {
     state.sub_converter.start().await
 }
 
 #[tauri::command]
-async fn stop_subconverter(
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn stop_subconverter(state: State<'_, AppState>) -> Result<String, String> {
     state.sub_converter.stop().await
 }
 
@@ -928,17 +680,13 @@ async fn convert_subscription_via_tool(
     Ok(servers)
 }
 
-// ============================================================
-// App Entry Point
-// ============================================================
+// ── App Entry Point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize logger
     let logger = app_logger::AppLogger::init();
     APP_LOGGER.set(logger).ok();
 
-    // Build initial knowledge base synchronously using blocking runtime
     let kb = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(async { KnowledgeBase::load_or_create("unknown").await });
@@ -959,26 +707,22 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
-            // Logs
             get_app_logs,
             clear_app_logs,
             clear_core_logs,
             save_ai_api_key,
             load_ai_api_key,
             clear_ai_api_key,
-            // History
             save_chat,
             load_chat,
             list_chats,
             delete_chat,
             search_chats,
             generate_conv_title,
-            // AI + RAG
             chat_with_ai,
             search_history_knowledge,
             refresh_knowledge_base,
             search_knowledge,
-            // Config
             parse_proxy_link,
             parse_subscription_content,
             generate_config,
@@ -987,7 +731,6 @@ pub fn run() {
             get_active_config_path,
             list_saved_configs,
             delete_saved_config,
-            // Core
             start_core,
             stop_core,
             get_core_status,
@@ -998,16 +741,12 @@ pub fn run() {
             download_xray_core,
             auto_detect_core,
             resolve_core,
-            // System Proxy
             enable_proxy,
             disable_proxy,
-            // Latency & Health
             test_latency,
             start_health_monitor,
             stop_health_monitor,
-            // Subscription
             fetch_subscription,
-            // SubConverter
             install_subconverter,
             start_subconverter,
             stop_subconverter,
@@ -1016,189 +755,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ================================================================
-    // parse_tool_calls
-    // ================================================================
-
-    #[test]
-    fn test_parse_tool_calls_single() {
-        let text = "我来帮你获取订阅\n[[TOOL:fetch_subscription(https://example.com/sub)]]";
-        let calls = parse_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "fetch_subscription");
-        assert_eq!(calls[0].1, "https://example.com/sub");
-    }
-
-    #[test]
-    fn test_allowed_agent_tools_include_declared_tools() {
-        for tool in [
-            "fetch_subscription",
-            "convert_subscription",
-            "subconverter_status",
-            "parse_proxy_links",
-        ] {
-            assert!(is_allowed_agent_tool(tool));
-        }
-    }
-
-    #[test]
-    fn test_agent_tool_allowlist_blocks_unknown_tools() {
-        assert!(!is_allowed_agent_tool("start_core"));
-        assert!(!is_allowed_agent_tool("write_file"));
-        assert!(!is_allowed_agent_tool("shell"));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_multiple() {
-        let text = "\
-[[TOOL:fetch_subscription(https://a.com/sub)]]\n\
-一些中间文本\n\
-[[TOOL:subconverter_status()]]";
-        let calls = parse_tool_calls(text);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "fetch_subscription");
-        assert_eq!(calls[1].0, "subconverter_status");
-    }
-
-    #[test]
-    fn test_parse_tool_calls_none() {
-        let text = "这是一段普通回复，没有任何工具调用。";
-        let calls = parse_tool_calls(text);
-        assert_eq!(calls.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_tool_calls_url_with_query_params() {
-        let text = "[[TOOL:convert_subscription(https://sub.example.com/api/v1/client/subscribe?token=abc123&flag=v2ray)]]";
-        let calls = parse_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "convert_subscription");
-        assert!(calls[0].1.contains("token=abc123"));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_proxy_links_multiline() {
-        let text = "[[TOOL:parse_proxy_links(vmess://abc123\nvless://def456)]]";
-        let calls = parse_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "parse_proxy_links");
-        assert!(calls[0].1.contains("vmess://"));
-    }
-
-    #[test]
-    fn test_parse_tool_calls_empty_args() {
-        let text = "[[TOOL:subconverter_status()]]";
-        let calls = parse_tool_calls(text);
-        // After regex fix: `.*?` matches empty args too
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "subconverter_status");
-        assert_eq!(calls[0].1, "");
-    }
-
-
-    // ================================================================
-    // format_servers_result
-    // ================================================================
-
-    #[test]
-    fn test_format_servers_result_empty() {
-        let result = format_servers_result(&[]);
-        assert!(result.contains("0 个节点"));
-    }
-
-    #[test]
-    fn test_format_servers_result_single() {
-        let servers = vec![ServerConfig {
-            id: "1".into(),
-            name: "HK-Node".into(),
-            protocol: "vless".into(),
-            address: "hk.example.com".into(),
-            port: 443,
-            uuid: None, password: None, alter_id: None, encryption: None,
-            flow: None, network: None, security: None, sni: None,
-            path: None, host: None, reality_public_key: None,
-            reality_short_id: None, fingerprint: None, allow_insecure: None,
-        }];
-        let result = format_servers_result(&servers);
-        assert!(result.contains("1 个节点"));
-        assert!(result.contains("VLESS"));
-        assert!(result.contains("HK-Node"));
-        assert!(result.contains("hk.example.com:443"));
-    }
-
-    #[test]
-    fn test_format_servers_result_truncates_at_20() {
-        let servers: Vec<ServerConfig> = (0..25)
-            .map(|i| ServerConfig {
-                id: format!("{}", i),
-                name: format!("Node-{}", i),
-                protocol: "vmess".into(),
-                address: format!("{}.example.com", i),
-                port: 443,
-                uuid: None, password: None, alter_id: None, encryption: None,
-                flow: None, network: None, security: None, sni: None,
-                path: None, host: None, reality_public_key: None,
-                reality_short_id: None, fingerprint: None, allow_insecure: None,
-            })
-            .collect();
-
-        let result = format_servers_result(&servers);
-        assert!(result.contains("25 个节点"));
-        assert!(result.contains("还有 5 个节点")); // 25 - 20 = 5
-    }
-
-    // ================================================================
-    // strip_tool_markers
-    // ================================================================
-
-    #[test]
-    fn test_strip_tool_markers_single() {
-        let text = "我来帮你获取\n[[TOOL:fetch_subscription(https://example.com)]]\n等一下";
-        let result = strip_tool_markers(text);
-        assert!(!result.contains("[[TOOL:"));
-        assert!(result.contains("🔧"));
-        assert!(result.contains("fetch_subscription"));
-    }
-
-    #[test]
-    fn test_strip_tool_markers_multiple() {
-        let text = "[[TOOL:fetch_subscription(url1)]]\n文本\n[[TOOL:convert_subscription(url2)]]";
-        let result = strip_tool_markers(text);
-        assert!(!result.contains("[[TOOL:"));
-        // Both should be replaced
-        assert!(result.contains("fetch_subscription"));
-        assert!(result.contains("convert_subscription"));
-    }
-
-    #[test]
-    fn test_strip_tool_markers_no_markers() {
-        let text = "这是一段完全正常的回复，没有工具标记。";
-        let result = strip_tool_markers(text);
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn test_strip_tool_markers_preserves_surrounding_text() {
-        let text = "开始文本\n[[TOOL:subconverter_status(check)]]\n结束文本";
-        let result = strip_tool_markers(text);
-        assert!(result.contains("开始文本"));
-        assert!(result.contains("结束文本"));
-    }
-
-    #[test]
-    fn test_strip_tool_markers_multiline_and_empty_args() {
-        let text = "开始\n[[TOOL:parse_proxy_links(vmess://abc\nvless://def)]]\n[[TOOL:subconverter_status()]]\n结束";
-        let result = strip_tool_markers(text);
-        assert!(!result.contains("[[TOOL:"));
-        assert!(result.contains("parse_proxy_links"));
-        assert!(result.contains("subconverter_status"));
-        assert!(result.contains("开始"));
-        assert!(result.contains("结束"));
-    }
 }

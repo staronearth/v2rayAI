@@ -132,7 +132,12 @@ impl CoreManager {
 
     #[cfg(unix)]
     async fn stop_stale_cores(&self, core_path: &str, config_path: &str) {
-        let Ok(output) = Command::new("pgrep").arg("-f").arg(core_path).output().await else {
+        let Ok(output) = Command::new("pgrep")
+            .arg("-f")
+            .arg(core_path)
+            .output()
+            .await
+        else {
             return;
         };
         if !output.status.success() {
@@ -141,7 +146,10 @@ impl CoreManager {
 
         let current_pid = std::process::id();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for pid in stdout.lines().filter_map(|line| line.trim().parse::<u32>().ok()) {
+        for pid in stdout
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+        {
             if pid == current_pid {
                 continue;
             }
@@ -394,8 +402,8 @@ pub async fn download_xray(download_url: &str, install_dir: &str) -> Result<Stri
                 binary_path = Some(out_path);
             } else if data_files.contains(&file.name()) {
                 let out_path = format!("{}/{}", install_dir, file.name());
-                let mut out_file =
-                    std::fs::File::create(&out_path).map_err(|e| format!("创建数据文件失败：{}", e))?;
+                let mut out_file = std::fs::File::create(&out_path)
+                    .map_err(|e| format!("创建数据文件失败：{}", e))?;
                 std::io::copy(&mut file, &mut out_file)
                     .map_err(|e| format!("写入数据文件失败：{}", e))?;
             }
@@ -572,8 +580,11 @@ fn get_platform_asset_name() -> String {
 }
 
 fn core_log_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".v2rayai")
         .join("logs")
         .join("core.log")
 }

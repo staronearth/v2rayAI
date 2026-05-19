@@ -31,7 +31,10 @@ pub fn parse_traffic_line(log_line: &str) -> Option<TrafficEvent> {
     if let Some(captures) = re.captures(log_line) {
         let network = captures.get(1).map_or("", |m| m.as_str()).to_string();
         let host = captures.get(2).map_or("", |m| m.as_str()).to_string();
-        let port = captures.get(3).and_then(|m| m.as_str().parse::<u16>().ok()).unwrap_or(0);
+        let port = captures
+            .get(3)
+            .and_then(|m| m.as_str().parse::<u16>().ok())
+            .unwrap_or(0);
         let route = captures.get(4).map_or("", |m| m.as_str()).to_string();
 
         Some(TrafficEvent {
@@ -124,4 +127,3 @@ mod tests {
         assert!(event.timestamp > 0);
     }
 }
-

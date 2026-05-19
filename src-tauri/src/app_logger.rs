@@ -1,6 +1,5 @@
 /// In-memory application logger that captures `log` crate messages
 /// and exposes them via Tauri commands for the frontend to display.
-
 use log::{Level, Log, Metadata, Record};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -117,7 +116,11 @@ fn append_entry(path: &PathBuf, entry: &LogEntry) {
     let Ok(line) = serde_json::to_string(entry) else {
         return;
     };
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "{}", line);
     }
 }

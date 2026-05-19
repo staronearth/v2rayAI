@@ -1,6 +1,5 @@
 /// Persistent chat history storage
 /// Stores conversations as JSON files in ~/.v2rayai/history/
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
@@ -50,8 +49,7 @@ pub async fn save_conversation(conv: &Conversation) -> Result<(), String> {
         .await
         .map_err(|e| format!("创建历史目录失败：{}", e))?;
 
-    let json = serde_json::to_string(conv)
-        .map_err(|e| format!("序列化对话失败：{}", e))?;
+    let json = serde_json::to_string(conv).map_err(|e| format!("序列化对话失败：{}", e))?;
 
     fs::write(conv_path(&conv.id), json.as_bytes())
         .await
@@ -64,8 +62,7 @@ pub async fn load_conversation(id: &str) -> Result<Conversation, String> {
         .await
         .map_err(|e| format!("读取对话失败：{}", e))?;
 
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("解析对话失败：{}", e))
+    serde_json::from_slice(&bytes).map_err(|e| format!("解析对话失败：{}", e))
 }
 
 /// List all conversations (metadata only, sorted by updated_at desc)
@@ -89,11 +86,18 @@ pub async fn list_conversations() -> Result<Vec<ConversationMeta>, String> {
 
         if let Ok(bytes) = fs::read(entry.path()).await {
             if let Ok(conv) = serde_json::from_slice::<Conversation>(&bytes) {
-                let preview = conv.messages.iter()
+                let preview = conv
+                    .messages
+                    .iter()
                     .find(|m| m.role == "user")
                     .map(|m| {
-                        let p = m.content.chars().take(80).collect::<String>();
-                        if m.content.len() > 80 { format!("{}…", p) } else { p }
+                        let mut chars = m.content.chars();
+                        let p: String = chars.by_ref().take(80).collect();
+                        if chars.next().is_some() {
+                            format!("{}…", p)
+                        } else {
+                            p
+                        }
                     })
                     .unwrap_or_else(|| "（空对话）".to_string());
 
@@ -142,26 +146,38 @@ pub async fn search_conversations(query: &str) -> Result<Vec<ConversationMeta>, 
         if let Ok(bytes) = fs::read(entry.path()).await {
             if let Ok(conv) = serde_json::from_slice::<Conversation>(&bytes) {
                 let in_title = conv.title.to_lowercase().contains(&query_lower);
-                let in_content = conv.messages.iter()
+                let in_content = conv
+                    .messages
+                    .iter()
                     .any(|m| m.content.to_lowercase().contains(&query_lower));
 
                 if in_title || in_content {
-                    let preview = conv.messages.iter()
+                    let preview = conv
+                        .messages
+                        .iter()
                         .find(|m| m.role == "user")
                         .map(|m| {
-                            let p = m.content.chars().take(80).collect::<String>();
-                            if m.content.len() > 80 { format!("{}…", p) } else { p }
+                            let mut chars = m.content.chars();
+                            let p: String = chars.by_ref().take(80).collect();
+                            if chars.next().is_some() {
+                                format!("{}…", p)
+                            } else {
+                                p
+                            }
                         })
                         .unwrap_or_else(|| "（空对话）".to_string());
 
-                    results.push((conv.updated_at, ConversationMeta {
-                        id: conv.id.clone(),
-                        title: conv.title.clone(),
-                        created_at: conv.created_at,
-                        updated_at: conv.updated_at,
-                        message_count: conv.messages.len(),
-                        preview,
-                    }));
+                    results.push((
+                        conv.updated_at,
+                        ConversationMeta {
+                            id: conv.id.clone(),
+                            title: conv.title.clone(),
+                            created_at: conv.created_at,
+                            updated_at: conv.updated_at,
+                            message_count: conv.messages.len(),
+                            preview,
+                        },
+                    ));
                 }
             }
         }
@@ -173,11 +189,17 @@ pub async fn search_conversations(query: &str) -> Result<Vec<ConversationMeta>, 
 
 /// Auto-generate a title from the first user message
 pub fn auto_title(messages: &[ChatMessage]) -> String {
-    messages.iter()
+    messages
+        .iter()
         .find(|m| m.role == "user")
         .map(|m| {
-            let title: String = m.content.chars().take(30).collect();
-            if m.content.len() > 30 { format!("{}…", title) } else { title }
+            let mut chars = m.content.chars();
+            let title: String = chars.by_ref().take(30).collect();
+            if chars.next().is_some() {
+                format!("{}…", title)
+            } else {
+                title
+            }
         })
         .unwrap_or_else(|| "新对话".to_string())
 }
@@ -207,13 +229,47 @@ fn rag_tokenize(text: &str) -> Vec<String> {
 
 /// Technical keyword list shared with knowledge_base scoring logic.
 const TECH_KEYWORDS: &[&str] = &[
-    "vless", "vmess", "trojan", "shadowsocks", "reality", "xtls",
-    "tls", "websocket", "ws", "grpc", "tcp", "http", "uuid", "flow",
-    "routing", "outbound", "inbound", "dns", "sni", "fingerprint",
-    "encryption", "alterid", "network", "security", "protocol",
-    "publickey", "privatekey", "shortid", "servername", "vision",
-    "subscription", "hysteria", "tuic", "cdn", "cloudflare",
-    "geosite", "geoip", "direct", "proxy", "block", "sniffing",
+    "vless",
+    "vmess",
+    "trojan",
+    "shadowsocks",
+    "reality",
+    "xtls",
+    "tls",
+    "websocket",
+    "ws",
+    "grpc",
+    "tcp",
+    "http",
+    "uuid",
+    "flow",
+    "routing",
+    "outbound",
+    "inbound",
+    "dns",
+    "sni",
+    "fingerprint",
+    "encryption",
+    "alterid",
+    "network",
+    "security",
+    "protocol",
+    "publickey",
+    "privatekey",
+    "shortid",
+    "servername",
+    "vision",
+    "subscription",
+    "hysteria",
+    "tuic",
+    "cdn",
+    "cloudflare",
+    "geosite",
+    "geoip",
+    "direct",
+    "proxy",
+    "block",
+    "sniffing",
 ];
 
 /// Score a single text block against query terms.
@@ -276,10 +332,16 @@ pub async fn search_history_rag(
 
         for (i, msg) in conv.messages.iter().enumerate() {
             // Title gets 3× weight for query term match
-            let title_bonus = if conv.title.to_lowercase()
+            let title_bonus = if conv
+                .title
+                .to_lowercase()
                 .split_whitespace()
                 .any(|w| query_terms.iter().any(|qt| w.contains(qt.as_str())))
-            { 2.0 } else { 0.0 };
+            {
+                2.0
+            } else {
+                0.0
+            };
 
             let s = rag_score(&msg.content, &query_terms) + title_bonus;
             if s > best_score {
@@ -300,7 +362,11 @@ pub async fn search_history_rag(
             .map(|m| {
                 let role_label = if m.role == "user" { "用户" } else { "助手" };
                 let content: String = m.content.chars().take(max_snippet_chars / 2).collect();
-                let ellipsis = if m.content.len() > max_snippet_chars / 2 { "…" } else { "" };
+                let ellipsis = if m.content.len() > max_snippet_chars / 2 {
+                    "…"
+                } else {
+                    ""
+                };
                 format!("**[{}]**: {}{}", role_label, content, ellipsis)
             })
             .collect();
@@ -314,7 +380,11 @@ pub async fn search_history_rag(
     }
 
     // Sort by score descending, return top-k
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.into_iter().take(top_k).collect()
 }
 

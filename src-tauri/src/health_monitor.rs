@@ -1,7 +1,5 @@
 /// Health monitoring and real-world latency testing for proxy connections
-
 use serde::{Deserialize, Serialize};
-use std::net::ToSocketAddrs;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,26 +15,52 @@ pub async fn test_tcp_latency(host: &str, port: u16, timeout_secs: u64) -> Laten
     let addr_str = format!("{}:{}", host, port);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let addr = match addr_str.to_socket_addrs() {
+    // Use async DNS resolution to avoid blocking the Tokio thread pool
+    let addr = match tokio::net::lookup_host(&addr_str).await {
         Ok(mut addrs) => match addrs.next() {
             Some(a) => a,
-            None => return LatencyResult { tcp_ms: None, http_ms: None, reachable: false,
-                error: Some("DNS 解析失败".into()) },
+            None => {
+                return LatencyResult {
+                    tcp_ms: None,
+                    http_ms: None,
+                    reachable: false,
+                    error: Some("DNS 解析失败".into()),
+                }
+            }
         },
-        Err(e) => return LatencyResult { tcp_ms: None, http_ms: None, reachable: false,
-            error: Some(format!("地址解析失败：{}", e)) },
+        Err(e) => {
+            return LatencyResult {
+                tcp_ms: None,
+                http_ms: None,
+                reachable: false,
+                error: Some(format!("地址解析失败：{}", e)),
+            }
+        }
     };
 
     let start = Instant::now();
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(_)) => {
             let ms = start.elapsed().as_millis() as u64;
-            LatencyResult { tcp_ms: Some(ms), http_ms: None, reachable: true, error: None }
+            LatencyResult {
+                tcp_ms: Some(ms),
+                http_ms: None,
+                reachable: true,
+                error: None,
+            }
         }
-        Ok(Err(e)) => LatencyResult { tcp_ms: None, http_ms: None, reachable: false,
-            error: Some(format!("连接失败：{}", e)) },
-        Err(_) => LatencyResult { tcp_ms: None, http_ms: None, reachable: false,
-            error: Some(format!("超时（{}s）", timeout_secs)) },
+        Ok(Err(e)) => LatencyResult {
+            tcp_ms: None,
+            http_ms: None,
+            reachable: false,
+            error: Some(format!("连接失败：{}", e)),
+        },
+        Err(_) => LatencyResult {
+            tcp_ms: None,
+            http_ms: None,
+            reachable: false,
+            error: Some(format!("超时（{}s）", timeout_secs)),
+        },
     }
 }
 
@@ -50,25 +74,44 @@ pub async fn test_via_proxy(http_proxy_port: u16, timeout_secs: u64) -> LatencyR
         .build()
     {
         Ok(c) => c,
-        Err(e) => return LatencyResult {
-            tcp_ms: None, http_ms: None, reachable: false,
-            error: Some(format!("创建 HTTP 客户端失败：{}", e)),
-        },
+        Err(e) => {
+            return LatencyResult {
+                tcp_ms: None,
+                http_ms: None,
+                reachable: false,
+                error: Some(format!("创建 HTTP 客户端失败：{}", e)),
+            }
+        }
     };
 
     let start = Instant::now();
-    match client.get("http://www.gstatic.com/generate_204").send().await {
+    match client
+        .get("http://www.gstatic.com/generate_204")
+        .send()
+        .await
+    {
         Ok(resp) => {
             let ms = start.elapsed().as_millis() as u64;
             if resp.status().as_u16() == 204 {
-                LatencyResult { tcp_ms: None, http_ms: Some(ms), reachable: true, error: None }
+                LatencyResult {
+                    tcp_ms: None,
+                    http_ms: Some(ms),
+                    reachable: true,
+                    error: None,
+                }
             } else {
-                LatencyResult { tcp_ms: None, http_ms: Some(ms), reachable: false,
-                    error: Some(format!("HTTP {}", resp.status())) }
+                LatencyResult {
+                    tcp_ms: None,
+                    http_ms: Some(ms),
+                    reachable: false,
+                    error: Some(format!("HTTP {}", resp.status())),
+                }
             }
         }
         Err(e) => LatencyResult {
-            tcp_ms: None, http_ms: None, reachable: false,
+            tcp_ms: None,
+            http_ms: None,
+            reachable: false,
             error: Some(format!("代理请求失败：{}", e)),
         },
     }
@@ -93,7 +136,7 @@ pub async fn full_latency_test(host: &str, port: u16, http_proxy_port: u16) -> L
 // ── Health monitor (background task) ──────────────────────────
 
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthEvent {
@@ -153,9 +196,11 @@ impl HealthMonitor {
                     message: if healthy {
                         format!("连接正常 ({}ms)", result.http_ms.unwrap_or(0))
                     } else {
-                        format!("连接异常 (连续{}次失败): {}",
+                        format!(
+                            "连接异常 (连续{}次失败): {}",
                             failures,
-                            result.error.unwrap_or_default())
+                            result.error.unwrap_or_default()
+                        )
                     },
                 };
 

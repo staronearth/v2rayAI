@@ -4,14 +4,13 @@
 ///
 /// Design: mirrors the pattern from core_manager.rs (find → download → start → stop).
 /// Install emits realtime "sc-progress" events via Tauri AppHandle.
-
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tokio::process::{Child, Command};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::process::Stdio;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 const SUBCONV_PORT: u16 = 25500;
 const GITHUB_RELEASES_URL: &str =
@@ -59,18 +58,25 @@ pub struct SubConverterManager {
 
 /// Helper: emit a progress event (fire-and-forget)
 fn emit_progress(app: &AppHandle, stage: &str, msg: &str, percent: u8) {
-    let _ = app.emit("sc-progress", ProgressEvent {
-        stage: stage.to_string(),
-        message: msg.to_string(),
-        percent,
-    });
+    let _ = app.emit(
+        "sc-progress",
+        ProgressEvent {
+            stage: stage.to_string(),
+            message: msg.to_string(),
+            percent,
+        },
+    );
 }
 
 /// Format bytes to human-readable
 fn fmt_bytes(b: u64) -> String {
-    if b < 1024 { return format!("{} B", b); }
+    if b < 1024 {
+        return format!("{} B", b);
+    }
     let kb = b as f64 / 1024.0;
-    if kb < 1024.0 { return format!("{:.1} KB", kb); }
+    if kb < 1024.0 {
+        return format!("{:.1} KB", kb);
+    }
     let mb = kb / 1024.0;
     format!("{:.2} MB", mb)
 }
@@ -118,7 +124,11 @@ impl SubConverterManager {
         }
 
         // Check PATH
-        let cmd_name = if cfg!(target_os = "windows") { "where" } else { "which" };
+        let cmd_name = if cfg!(target_os = "windows") {
+            "where"
+        } else {
+            "which"
+        };
         if let Ok(output) = Command::new(cmd_name).arg("subconverter").output().await {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -193,7 +203,12 @@ impl SubConverterManager {
         // ── Step 1: Fetch release info ──
         emit_progress(app, "info", "正在获取最新版本信息...", 0);
         let release = Self::fetch_latest_release().await?;
-        emit_progress(app, "info", &format!("找到版本 {}，准备下载...", release.version), 0);
+        emit_progress(
+            app,
+            "info",
+            &format!("找到版本 {}，准备下载...", release.version),
+            0,
+        );
 
         let install_dir = Self::install_dir();
         tokio::fs::create_dir_all(&install_dir)
@@ -214,7 +229,11 @@ impl SubConverterManager {
             .map_err(|e| format!("下载失败：{}", e))?;
 
         let total_size = resp.content_length().unwrap_or(0);
-        let total_str = if total_size > 0 { fmt_bytes(total_size) } else { "未知大小".into() };
+        let total_str = if total_size > 0 {
+            fmt_bytes(total_size)
+        } else {
+            "未知大小".into()
+        };
         emit_progress(app, "download", &format!("开始下载 ({})...", total_str), 0);
 
         // Stream download
@@ -241,13 +260,23 @@ impl SubConverterManager {
                 emit_progress(
                     app,
                     "download",
-                    &format!("下载中 {} / {} ({}%)", fmt_bytes(downloaded), total_str, percent),
+                    &format!(
+                        "下载中 {} / {} ({}%)",
+                        fmt_bytes(downloaded),
+                        total_str,
+                        percent
+                    ),
                     percent,
                 );
             }
         }
 
-        emit_progress(app, "info", &format!("下载完成 ({})，正在解压...", fmt_bytes(downloaded)), 100);
+        emit_progress(
+            app,
+            "info",
+            &format!("下载完成 ({})，正在解压...", fmt_bytes(downloaded)),
+            100,
+        );
 
         // ── Step 3: Extract ──
         let dir_str = install_dir.to_string_lossy().to_string();
@@ -256,48 +285,60 @@ impl SubConverterManager {
         let out_path = tokio::task::spawn_blocking(move || -> Result<String, String> {
             use std::io::Cursor;
 
-            let cursor = Cursor::new(&raw);
-            let gz = flate2::read::GzDecoder::new(cursor);
-            let mut archive = tar::Archive::new(gz);
-
-            archive
-                .unpack(&dir_str)
-                .map_err(|e| format!("解压失败：{}", e))?;
-
-            // subconverter tar.gz extracts into a subconverter/ subdirectory
-            let extracted_bin = Path::new(&dir_str)
-                .join("subconverter")
-                .join(&binary_name);
-
-            if extracted_bin.exists() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(
-                        &extracted_bin,
-                        std::fs::Permissions::from_mode(0o755),
-                    )
-                    .map_err(|e| format!("设置权限失败：{}", e))?;
-                }
-                return Ok(extracted_bin.to_string_lossy().to_string());
+            #[cfg(target_os = "windows")]
+            {
+                // Windows asset is a .7z file — use the zip crate which cannot open 7z.
+                // Instruct the user to install subconverter manually on Windows.
+                return Err(
+                    "Windows 下 subconverter 为 .7z 格式，请手动解压后将 subconverter.exe 放入 \
+                     %USERPROFILE%\\.v2rayai\\subconverter\\ 目录中"
+                        .to_string(),
+                );
             }
 
-            // Fallback: binary directly in directory
-            let direct_bin = Path::new(&dir_str).join(&binary_name);
-            if direct_bin.exists() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(
-                        &direct_bin,
-                        std::fs::Permissions::from_mode(0o755),
-                    )
-                    .ok();
-                }
-                return Ok(direct_bin.to_string_lossy().to_string());
-            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let cursor = Cursor::new(&raw);
+                let gz = flate2::read::GzDecoder::new(cursor);
+                let mut archive = tar::Archive::new(gz);
 
-            Err(format!("解压完成但未找到 {} 二进制文件", binary_name))
+                archive
+                    .unpack(&dir_str)
+                    .map_err(|e| format!("解压失败：{}", e))?;
+
+                // subconverter tar.gz extracts into a subconverter/ subdirectory
+                let extracted_bin = Path::new(&dir_str).join("subconverter").join(&binary_name);
+
+                if extracted_bin.exists() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &extracted_bin,
+                            std::fs::Permissions::from_mode(0o755),
+                        )
+                        .map_err(|e| format!("设置权限失败：{}", e))?;
+                    }
+                    return Ok(extracted_bin.to_string_lossy().to_string());
+                }
+
+                // Fallback: binary directly in directory
+                let direct_bin = Path::new(&dir_str).join(&binary_name);
+                if direct_bin.exists() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &direct_bin,
+                            std::fs::Permissions::from_mode(0o755),
+                        )
+                        .ok();
+                    }
+                    return Ok(direct_bin.to_string_lossy().to_string());
+                }
+
+                Err(format!("解压完成但未找到 {} 二进制文件", binary_name))
+            }
         })
         .await
         .map_err(|e| format!("解压线程错误：{}", e))??;
@@ -381,10 +422,7 @@ impl SubConverterManager {
     pub async fn convert_subscription(&self, url: &str) -> Result<String, String> {
         // Ensure subconverter is running
         if self.child.lock().await.is_none() {
-            return Err(
-                "subconverter 未运行，请先在「工具」页面安装并启动"
-                    .to_string(),
-            );
+            return Err("subconverter 未运行，请先在「工具」页面安装并启动".to_string());
         }
 
         let encoded_url = urlencoding::encode(url);

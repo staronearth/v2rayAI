@@ -35,8 +35,8 @@ impl ConfigManager {
             fs::copy(&active_path, &backup).await.ok();
         }
 
-        let json = serde_json::to_string_pretty(content)
-            .map_err(|e| format!("JSON 序列化失败：{}", e))?;
+        let json =
+            serde_json::to_string_pretty(content).map_err(|e| format!("JSON 序列化失败：{}", e))?;
 
         fs::write(&active_path, json.as_bytes())
             .await
@@ -47,7 +47,10 @@ impl ConfigManager {
 
     /// Get the path of the active config file
     pub fn active_config_path(&self) -> String {
-        self.config_dir.join("active.json").to_string_lossy().to_string()
+        self.config_dir
+            .join("active.json")
+            .to_string_lossy()
+            .to_string()
     }
 
     /// Read active config
@@ -65,8 +68,8 @@ impl ConfigManager {
             .await
             .map_err(|e| format!("创建目录失败：{}", e))?;
         let path = self.config_dir.join(format!("{}.json", config.id));
-        let json = serde_json::to_string_pretty(config)
-            .map_err(|e| format!("序列化失败：{}", e))?;
+        let json =
+            serde_json::to_string_pretty(config).map_err(|e| format!("序列化失败：{}", e))?;
         fs::write(&path, json.as_bytes())
             .await
             .map_err(|e| format!("写入失败：{}", e))?;
@@ -84,7 +87,10 @@ impl ConfigManager {
         while let Ok(Some(entry)) = dir.next_entry().await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.ends_with(".json") && name_str != "active.json" && !name_str.ends_with(".bak") {
+            if name_str.ends_with(".json")
+                && name_str != "active.json"
+                && !name_str.ends_with(".bak")
+            {
                 if let Ok(bytes) = fs::read(entry.path()).await {
                     if let Ok(cfg) = serde_json::from_slice::<SavedConfig>(&bytes) {
                         configs.push(cfg);
@@ -99,7 +105,9 @@ impl ConfigManager {
     /// Delete a named config
     pub async fn delete_config(&self, id: &str) -> Result<(), String> {
         let path = self.config_dir.join(format!("{}.json", id));
-        fs::remove_file(&path).await.map_err(|e| format!("删除失败：{}", e))
+        fs::remove_file(&path)
+            .await
+            .map_err(|e| format!("删除失败：{}", e))
     }
 }
 

@@ -60,15 +60,22 @@ pub async fn load_ai_api_key() -> Result<Option<String>, String> {
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| format!("读取加密密钥失败：{}", e))?;
-    let file: SecretFile = serde_json::from_str(&text).map_err(|e| format!("解析加密密钥失败：{}", e))?;
+    let file: SecretFile =
+        serde_json::from_str(&text).map_err(|e| format!("解析加密密钥失败：{}", e))?;
     if file.version != 1 {
         return Err("不支持的密钥文件版本".to_string());
     }
 
     let master = get_or_create_master_key().await?;
-    let nonce = B64.decode(file.nonce).map_err(|e| format!("nonce 解码失败：{}", e))?;
-    let ciphertext = B64.decode(file.ciphertext).map_err(|e| format!("密文解码失败：{}", e))?;
-    let tag = B64.decode(file.tag).map_err(|e| format!("签名解码失败：{}", e))?;
+    let nonce = B64
+        .decode(file.nonce)
+        .map_err(|e| format!("nonce 解码失败：{}", e))?;
+    let ciphertext = B64
+        .decode(file.ciphertext)
+        .map_err(|e| format!("密文解码失败：{}", e))?;
+    let tag = B64
+        .decode(file.tag)
+        .map_err(|e| format!("签名解码失败：{}", e))?;
     let expected = sign(&derive_key(&master, b"mac"), &nonce, &ciphertext)?;
     if !constant_time_eq(&tag, &expected) {
         return Err("AI Key 密文校验失败".to_string());
@@ -152,7 +159,9 @@ async fn write_master_key(key: &[u8]) -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 async fn read_master_key() -> Result<Option<Vec<u8>>, String> {
-    let path = crate::config_manager::dirs_for_app().join("secure").join("master.key");
+    let path = crate::config_manager::dirs_for_app()
+        .join("secure")
+        .join("master.key");
     if !path.exists() {
         return Ok(None);
     }
@@ -166,7 +175,9 @@ async fn read_master_key() -> Result<Option<Vec<u8>>, String> {
 
 #[cfg(not(target_os = "macos"))]
 async fn write_master_key(key: &[u8]) -> Result<(), String> {
-    let path = crate::config_manager::dirs_for_app().join("secure").join("master.key");
+    let path = crate::config_manager::dirs_for_app()
+        .join("secure")
+        .join("master.key");
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -208,7 +219,8 @@ fn aes_ctr_crypt(key: &[u8; 32], nonce: &[u8], input: &[u8]) -> Vec<u8> {
 }
 
 fn sign(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("创建 HMAC 失败：{}", e))?;
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("创建 HMAC 失败：{}", e))?;
     mac.update(nonce);
     mac.update(ciphertext);
     Ok(mac.finalize().into_bytes().to_vec())

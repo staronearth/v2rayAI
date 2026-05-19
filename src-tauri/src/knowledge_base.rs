@@ -1,17 +1,15 @@
+use reqwest;
 /// RAG Knowledge Base
 /// Strategy C+A: Pre-chunked Xray docs embedded in binary + keyword TF-IDF scoring.
 /// If user has embedding API, falls back to proper cosine similarity.
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
-use reqwest;
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocChunk {
     pub id: String,
-    pub source: String,      // e.g. "xray-vless", "xray-reality"
+    pub source: String, // e.g. "xray-vless", "xray-reality"
     pub title: String,
     pub content: String,
     pub keywords: Vec<String>,
@@ -30,7 +28,9 @@ impl KnowledgeBase {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".v2rayai").join("knowledge_base.json")
+        PathBuf::from(home)
+            .join(".v2rayai")
+            .join("knowledge_base.json")
     }
 
     /// Load from disk or create from built-in chunks
@@ -59,8 +59,7 @@ impl KnowledgeBase {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.ok();
         }
-        let json = serde_json::to_string(self)
-            .map_err(|e| format!("序列化知识库失败：{}", e))?;
+        let json = serde_json::to_string(self).map_err(|e| format!("序列化知识库失败：{}", e))?;
         fs::write(&path, json.as_bytes())
             .await
             .map_err(|e| format!("保存知识库失败：{}", e))
@@ -75,8 +74,16 @@ impl KnowledgeBase {
             .map_err(|e| e.to_string())?;
 
         let sources = [
-            ("xray-readme", "README", "https://raw.githubusercontent.com/XTLS/Xray-core/main/README.md"),
-            ("xray-changelog", "CHANGELOG", "https://raw.githubusercontent.com/XTLS/Xray-core/main/CHANGELOG.md"),
+            (
+                "xray-readme",
+                "README",
+                "https://raw.githubusercontent.com/XTLS/Xray-core/main/README.md",
+            ),
+            (
+                "xray-changelog",
+                "CHANGELOG",
+                "https://raw.githubusercontent.com/XTLS/Xray-core/main/CHANGELOG.md",
+            ),
         ];
 
         let mut new_chunks: Vec<DocChunk> = get_builtin_chunks();
@@ -107,7 +114,10 @@ impl KnowledgeBase {
             return self.chunks.iter().take(top_k).collect();
         }
 
-        let mut scores: Vec<(usize, f32)> = self.chunks.iter().enumerate()
+        let mut scores: Vec<(usize, f32)> = self
+            .chunks
+            .iter()
+            .enumerate()
             .map(|(i, chunk)| {
                 let score = score_chunk(chunk, &query_terms);
                 (i, score)
@@ -117,7 +127,8 @@ impl KnowledgeBase {
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        scores.iter()
+        scores
+            .iter()
             .take(top_k)
             .map(|(i, _)| &self.chunks[*i])
             .collect()
@@ -132,7 +143,10 @@ impl KnowledgeBase {
 
         let mut ctx = String::from("\n\n---\n## 📚 相关文档（RAG 检索）\n\n");
         for chunk in chunks {
-            ctx.push_str(&format!("### {} ({})\n{}\n\n", chunk.title, chunk.source, chunk.content));
+            ctx.push_str(&format!(
+                "### {} ({})\n{}\n\n",
+                chunk.title, chunk.source, chunk.content
+            ));
         }
         ctx.push_str("---\n");
         ctx
@@ -225,14 +239,39 @@ fn split_into_chunks(text: &str, id_prefix: &str, source: &str, max_chars: usize
 fn extract_keywords(text: &str) -> Vec<String> {
     // Extract meaningful technical terms
     let tech_terms = [
-        "vless", "vmess", "trojan", "shadowsocks", "reality", "xtls",
-        "tls", "websocket", "grpc", "tcp", "http", "uuid", "flow",
-        "routing", "outbound", "inbound", "dns", "sni", "fingerprint",
-        "encryption", "alterId", "network", "security", "protocol",
-        "publicKey", "privateKey", "shortId", "serverName", "vision",
+        "vless",
+        "vmess",
+        "trojan",
+        "shadowsocks",
+        "reality",
+        "xtls",
+        "tls",
+        "websocket",
+        "grpc",
+        "tcp",
+        "http",
+        "uuid",
+        "flow",
+        "routing",
+        "outbound",
+        "inbound",
+        "dns",
+        "sni",
+        "fingerprint",
+        "encryption",
+        "alterId",
+        "network",
+        "security",
+        "protocol",
+        "publicKey",
+        "privateKey",
+        "shortId",
+        "serverName",
+        "vision",
     ];
     let text_lower = text.to_lowercase();
-    tech_terms.iter()
+    tech_terms
+        .iter()
         .filter(|&&t| text_lower.contains(t))
         .map(|&t| t.to_string())
         .collect()

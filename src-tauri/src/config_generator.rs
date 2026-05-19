@@ -49,7 +49,7 @@ impl ServerConfig {
         };
 
         serde_json::json!({
-            "log": { 
+            "log": {
                 "loglevel": "info",
                 "access": ""
             },
@@ -118,8 +118,14 @@ impl ServerConfig {
     fn to_vless_outbound(&self) -> Value {
         let stream = self.build_stream_settings();
         let mut user: serde_json::Map<String, Value> = serde_json::Map::new();
-        user.insert("id".into(), Value::String(self.uuid.clone().unwrap_or_default()));
-        user.insert("encryption".into(), Value::String(self.encryption.clone().unwrap_or_else(|| "none".into())));
+        user.insert(
+            "id".into(),
+            Value::String(self.uuid.clone().unwrap_or_default()),
+        );
+        user.insert(
+            "encryption".into(),
+            Value::String(self.encryption.clone().unwrap_or_else(|| "none".into())),
+        );
         if let Some(flow) = non_empty_option(self.flow.as_deref()) {
             user.insert("flow".into(), Value::String(flow.to_string()));
         }
@@ -253,7 +259,7 @@ impl ServerConfig {
                 }]
             }),
             _ => serde_json::json!({
-                "domainStrategy": "AsIs",
+                "domainStrategy": "IPIfNonMatch",
                 "rules": [
                     {
                         "type": "field",
@@ -289,23 +295,25 @@ fn param(params: &std::collections::HashMap<String, String>, key: &str) -> Optio
 
 fn bool_param(params: &std::collections::HashMap<String, String>, keys: &[&str]) -> Option<bool> {
     keys.iter().find_map(|key| {
-        params.get(*key).and_then(|value| {
-            match value.trim().to_ascii_lowercase().as_str() {
+        params
+            .get(*key)
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" => Some(true),
                 "0" | "false" | "no" => Some(false),
                 _ => None,
-            }
-        })
+            })
     })
 }
 
 fn json_bool(value: &Value) -> Option<bool> {
     value.as_bool().or_else(|| {
-        value.as_str().and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" => Some(true),
-            "0" | "false" | "no" => Some(false),
-            _ => None,
-        })
+        value
+            .as_str()
+            .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            })
     })
 }
 
@@ -322,7 +330,10 @@ pub fn parse_share_link(link: &str) -> Result<ServerConfig, String> {
     } else if link.starts_with("ss://") {
         parse_ss_link(link)
     } else {
-        Err(format!("Unsupported link format: {}", &link[..20.min(link.len())]))
+        Err(format!(
+            "Unsupported link format: {}",
+            &link[..20.min(link.len())]
+        ))
     }
 }
 
@@ -336,7 +347,8 @@ fn parse_vmess_link(link: &str) -> Result<ServerConfig, String> {
         .map_err(|e| format!("Base64 decode failed: {}", e))?;
 
     let json_str = String::from_utf8(decoded).map_err(|e| format!("UTF-8 decode failed: {}", e))?;
-    let v: Value = serde_json::from_str(&json_str).map_err(|e| format!("JSON parse failed: {}", e))?;
+    let v: Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("JSON parse failed: {}", e))?;
 
     Ok(ServerConfig {
         id: uuid::Uuid::new_v4().to_string(),
@@ -356,10 +368,22 @@ fn parse_vmess_link(link: &str) -> Result<ServerConfig, String> {
         encryption: v["scy"].as_str().map(String::from),
         flow: None,
         network: v["net"].as_str().map(String::from),
-        security: v["tls"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        sni: v["sni"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        path: v["path"].as_str().filter(|s| !s.is_empty()).map(String::from),
-        host: v["host"].as_str().filter(|s| !s.is_empty()).map(String::from),
+        security: v["tls"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        sni: v["sni"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        path: v["path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        host: v["host"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
         password: None,
         reality_public_key: None,
         reality_short_id: None,
@@ -371,12 +395,17 @@ fn parse_vmess_link(link: &str) -> Result<ServerConfig, String> {
 fn parse_vless_link(link: &str) -> Result<ServerConfig, String> {
     // vless://uuid@address:port?params#name
     let url = Url::parse(link).map_err(|e| format!("URL parse failed: {}", e))?;
-    let params: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
 
     // Fragment (#name) is percent-encoded; the url crate decodes it for us
     let name = url
         .fragment()
-        .map(|f| urlencoding::decode(f).unwrap_or_else(|_| f.into()).into_owned())
+        .map(|f| {
+            urlencoding::decode(f)
+                .unwrap_or_else(|_| f.into())
+                .into_owned()
+        })
         .unwrap_or_else(|| "VLESS Node".to_string());
 
     Ok(ServerConfig {
@@ -400,7 +429,13 @@ fn parse_vless_link(link: &str) -> Result<ServerConfig, String> {
         fingerprint: param(&params, "fp"),
         allow_insecure: bool_param(
             &params,
-            &["allowInsecure", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify"],
+            &[
+                "allowInsecure",
+                "allowinsecure",
+                "allow_insecure",
+                "insecure",
+                "skip-cert-verify",
+            ],
         ),
     })
 }
@@ -408,11 +443,16 @@ fn parse_vless_link(link: &str) -> Result<ServerConfig, String> {
 fn parse_trojan_link(link: &str) -> Result<ServerConfig, String> {
     // trojan://password@address:port?params#name
     let url = Url::parse(link).map_err(|e| format!("URL parse failed: {}", e))?;
-    let params: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let params: std::collections::HashMap<String, String> =
+        url.query_pairs().into_owned().collect();
 
     let name = url
         .fragment()
-        .map(|f| urlencoding::decode(f).unwrap_or_else(|_| f.into()).into_owned())
+        .map(|f| {
+            urlencoding::decode(f)
+                .unwrap_or_else(|_| f.into())
+                .into_owned()
+        })
         .unwrap_or_else(|| "Trojan Node".to_string());
 
     Ok(ServerConfig {
@@ -436,7 +476,13 @@ fn parse_trojan_link(link: &str) -> Result<ServerConfig, String> {
         fingerprint: param(&params, "fp"),
         allow_insecure: bool_param(
             &params,
-            &["allowInsecure", "allowinsecure", "allow_insecure", "insecure", "skip-cert-verify"],
+            &[
+                "allowInsecure",
+                "allowinsecure",
+                "allow_insecure",
+                "insecure",
+                "skip-cert-verify",
+            ],
         ),
     })
 }
@@ -446,7 +492,10 @@ fn parse_ss_link(link: &str) -> Result<ServerConfig, String> {
     // or ss://base64(method:password@address:port)#name
     let without_prefix = &link[5..]; // Remove "ss://"
     let (main_part, name) = if let Some(hash_pos) = without_prefix.rfind('#') {
-        (&without_prefix[..hash_pos], urlencoding_decode(&without_prefix[hash_pos + 1..]))
+        (
+            &without_prefix[..hash_pos],
+            urlencoding_decode(&without_prefix[hash_pos + 1..]),
+        )
     } else {
         (without_prefix, "Shadowsocks Node".to_string())
     };
@@ -465,7 +514,8 @@ fn parse_ss_link(link: &str) -> Result<ServerConfig, String> {
             .and_then(|decoded| String::from_utf8(decoded).ok())
             .unwrap_or_else(|| urlencoding_decode(encoded));
 
-        let (method, password) = method_pass.split_once(':')
+        let (method, password) = method_pass
+            .split_once(':')
             .ok_or("Invalid ss format: missing ':'".to_string())?;
 
         let (address, port) = parse_host_port(server_part)?;
@@ -499,7 +549,9 @@ fn parse_ss_link(link: &str) -> Result<ServerConfig, String> {
 fn parse_host_port(s: &str) -> Result<(String, u16), String> {
     if let Some(colon_pos) = s.rfind(':') {
         let host = s[..colon_pos].to_string();
-        let port: u16 = s[colon_pos + 1..].parse().map_err(|e| format!("Invalid port: {}", e))?;
+        let port: u16 = s[colon_pos + 1..]
+            .parse()
+            .map_err(|e| format!("Invalid port: {}", e))?;
         Ok((host, port))
     } else {
         Err("Missing port in address".to_string())
@@ -507,10 +559,9 @@ fn parse_host_port(s: &str) -> Result<(String, u16), String> {
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    url::form_urlencoded::parse(s.as_bytes())
-        .map(|(k, v)| if v.is_empty() { k.to_string() } else { format!("{}={}", k, v) })
-        .collect::<Vec<_>>()
-        .join("")
+    urlencoding::decode(s)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 /// Parse a subscription content.
@@ -523,7 +574,14 @@ pub fn parse_subscription(content: &str) -> Vec<ServerConfig> {
 
     // ── Fast path: plain text links (starts with a known scheme) ──────────────
     let first_line = trimmed.lines().next().unwrap_or("").trim();
-    let known_schemes = ["vmess://", "vless://", "trojan://", "ss://", "hy2://", "hysteria2://"];
+    let known_schemes = [
+        "vmess://",
+        "vless://",
+        "trojan://",
+        "ss://",
+        "hy2://",
+        "hysteria2://",
+    ];
     let looks_like_plain = known_schemes.iter().any(|s| first_line.starts_with(s));
 
     if looks_like_plain {
@@ -584,7 +642,10 @@ mod tests {
         assert_eq!(node.name, "test_vmess");
         assert_eq!(node.address, "1.2.3.4");
         assert_eq!(node.port, 443);
-        assert_eq!(node.uuid.as_deref().unwrap(), "00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            node.uuid.as_deref().unwrap(),
+            "00000000-0000-0000-0000-000000000000"
+        );
         assert_eq!(node.alter_id, Some(0));
     }
 
@@ -649,7 +710,10 @@ mod tests {
         assert_eq!(node.name, "test_vless");
         assert_eq!(node.address, "1.2.3.4");
         assert_eq!(node.port, 443);
-        assert_eq!(node.uuid.as_deref().unwrap(), "00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            node.uuid.as_deref().unwrap(),
+            "00000000-0000-0000-0000-000000000000"
+        );
         assert_eq!(node.security.as_deref(), Some("tls"));
         assert_eq!(node.sni.as_deref(), Some("example.com"));
     }
@@ -718,7 +782,8 @@ mod tests {
 
     #[test]
     fn test_trojan_allow_insecure() {
-        let link = "trojan://my-password@trojan.example.com:443?security=tls&allowInsecure=1#Trojan节点";
+        let link =
+            "trojan://my-password@trojan.example.com:443?security=tls&allowInsecure=1#Trojan节点";
         let node = parse_share_link(link).unwrap();
         assert_eq!(node.allow_insecure, Some(true));
 
@@ -744,7 +809,8 @@ mod tests {
     #[test]
     fn test_ss_sip002_format() {
         // ss://base64(method:password)@address:port#name
-        let method_pass = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:my-secret-password");
+        let method_pass =
+            base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:my-secret-password");
         let link = format!("ss://{}@ss.example.com:8388#SS节点", method_pass);
         let node = parse_share_link(&link).unwrap();
         assert_eq!(node.protocol, "shadowsocks");
@@ -935,7 +1001,10 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
         let config = server.to_v2ray_config(1080, 1081, "rule");
         let outbound = &config["outbounds"][0];
         assert_eq!(outbound["protocol"], "trojan");
-        assert_eq!(outbound["settings"]["servers"][0]["password"], "test-password");
+        assert_eq!(
+            outbound["settings"]["servers"][0]["password"],
+            "test-password"
+        );
         assert_eq!(outbound["settings"]["servers"][0]["address"], "1.2.3.4");
     }
 
@@ -946,7 +1015,10 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
         let outbound = &config["outbounds"][0];
         assert_eq!(outbound["protocol"], "shadowsocks");
         assert_eq!(outbound["settings"]["servers"][0]["method"], "none");
-        assert_eq!(outbound["settings"]["servers"][0]["password"], "test-password");
+        assert_eq!(
+            outbound["settings"]["servers"][0]["password"],
+            "test-password"
+        );
     }
 
     // ================================================================
@@ -959,7 +1031,10 @@ trojan://pass@b.com:443?security=tls#Trojan-Node";
         let rules = routing["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["outboundTag"], "direct");
-        assert!(rules[0]["ip"].as_array().unwrap().contains(&serde_json::json!("192.168.0.0/16")));
+        assert!(rules[0]["ip"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("192.168.0.0/16")));
     }
 
     #[test]
