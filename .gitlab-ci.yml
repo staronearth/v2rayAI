@@ -1,0 +1,149 @@
+stages:
+  - build
+  - release
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  NODE_VERSION: "20"
+  RUST_VERSION: "stable"
+
+# ─── Linux 构建 ────────────────────────────────────────────────────────────────
+build:linux:
+  stage: build
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq
+        curl wget git
+        libwebkit2gtk-4.1-dev
+        libssl-dev
+        libayatana-appindicator3-dev
+        librsvg2-dev
+        patchelf
+        build-essential
+        pkg-config
+        libgtk-3-dev
+        libglib2.0-dev
+    # Node.js
+    - curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -
+    - apt-get install -y nodejs
+    # Rust
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION
+    - source $HOME/.cargo/env
+  script:
+    - npm ci
+    - npm run tauri build
+  artifacts:
+    name: "v2rayAI-linux-$CI_COMMIT_TAG"
+    paths:
+      - src-tauri/target/release/bundle/deb/*.deb
+      - src-tauri/target/release/bundle/rpm/*.rpm
+      - src-tauri/target/release/bundle/appimage/*.AppImage
+    expire_in: 7 days
+  cache:
+    key: linux-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cargo/registry
+      - .cargo/git
+      - src-tauri/target
+      - node_modules
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# ─── Windows 构建 ──────────────────────────────────────────────────────────────
+build:windows:
+  stage: build
+  tags:
+    - windows  # 需要注册 Windows Runner，或使用 GitLab SaaS Windows Runner
+  before_script:
+    - choco install nodejs --version=${NODE_VERSION} -y
+    - choco install rust -y
+    - refreshenv
+  script:
+    - npm ci
+    - npm run tauri build
+  artifacts:
+    name: "v2rayAI-windows-$CI_COMMIT_TAG"
+    paths:
+      - src-tauri/target/release/bundle/msi/*.msi
+      - src-tauri/target/release/bundle/nsis/*.exe
+    expire_in: 7 days
+  cache:
+    key: windows-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cargo/registry
+      - node_modules
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# ─── macOS 构建 ────────────────────────────────────────────────────────────────
+build:macos:
+  stage: build
+  tags:
+    - macos  # 需要注册 macOS Runner
+  before_script:
+    - brew install node@${NODE_VERSION} || true
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - source $HOME/.cargo/env
+  script:
+    - npm ci
+    - npm run tauri build
+  artifacts:
+    name: "v2rayAI-macos-$CI_COMMIT_TAG"
+    paths:
+      - src-tauri/target/release/bundle/dmg/*.dmg
+      - src-tauri/target/release/bundle/macos/*.app.tar.gz
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# ─── 创建 GitLab Release ───────────────────────────────────────────────────────
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: build:linux
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+      optional: true
+    - job: build:macos
+      artifacts: true
+      optional: true
+  script:
+    - echo "Creating release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "v2rayAI $CI_COMMIT_TAG"
+    description: |
+      ## v2rayAI $CI_COMMIT_TAG
+
+      AI 驱动的 v2ray/xray 代理配置工具。
+
+      ### 安装包下载
+
+      | 平台 | 格式 | 说明 |
+      |------|------|------|
+      | Linux | `.deb` | Debian/Ubuntu |
+      | Linux | `.AppImage` | 通用 Linux |
+      | Windows | `.msi` | Windows 安装包 |
+      | macOS | `.dmg` | macOS 安装包 |
+    assets:
+      links:
+        - name: "Linux (.deb)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse?job=build:linux"
+          link_type: package
+        - name: "Linux (.AppImage)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse?job=build:linux"
+          link_type: package
+        - name: "Windows (.msi)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse?job=build:windows"
+          link_type: package
+        - name: "macOS (.dmg)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse?job=build:macos"
+          link_type: package
+  rules:
+    - if: $CI_COMMIT_TAG
