@@ -5,6 +5,7 @@
 use crate::ai_service::{AiService, ChatMessage};
 use crate::config_generator::{parse_share_link, parse_subscription, ServerConfig};
 use crate::sub_converter::SubConverterManager;
+use crate::types::ToolSpec;
 use regex::Regex;
 use serde::Serialize;
 
@@ -30,11 +31,132 @@ pub struct AgentResult {
 
 // ── Agent Entry Point ─────────────────────────────────────────────────────────
 
-/// Run the agentic loop: call AI, dispatch tool calls, feed results back, repeat
-/// until no more tool calls or MAX_ITERATIONS is reached.
+/// Run the agentic loop. Tries native function calling first and transparently
+/// falls back to the text `[[TOOL:...]]` protocol when the endpoint rejects
+/// `tools` (4xx) or the model answers in text-protocol form instead of emitting
+/// native tool calls.
 ///
 /// `thread` is the full conversation history including the current user turn.
 pub async fn run(
+    ai: &AiService,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    thread: Vec<ChatMessage>,
+    sub_converter: &SubConverterManager,
+) -> Result<AgentResult, String> {
+    match run_native(ai, base_url, api_key, model, thread.clone(), sub_converter).await {
+        Ok(result) => Ok(result),
+        Err(RunErr::Fallback(reason)) => {
+            log::warn!("[Agent] Falling back to text protocol: {reason}");
+            run_text(ai, base_url, api_key, model, thread, sub_converter).await
+        }
+        Err(RunErr::Fatal(e)) => Err(e),
+    }
+}
+
+enum RunErr {
+    /// Endpoint/model doesn't do native tools — retry with the text protocol.
+    Fallback(String),
+    /// A genuine error that retrying wouldn't fix.
+    Fatal(String),
+}
+
+/// Native function-calling loop: advertise tools, consume `tool_calls`, and feed
+/// each result back as a `tool` message keyed by its `tool_call_id`.
+async fn run_native(
+    ai: &AiService,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    mut thread: Vec<ChatMessage>,
+    sub_converter: &SubConverterManager,
+) -> Result<AgentResult, RunErr> {
+    let specs = tool_specs();
+    let mut parsed_servers: Vec<ServerConfig> = Vec::new();
+
+    for iteration in 0..=MAX_ITERATIONS {
+        let completion = ai
+            .complete_with_tools(base_url, api_key, model, &thread, Some(&specs))
+            .await
+            .map_err(|e| {
+                if should_fallback_to_text(&e) {
+                    RunErr::Fallback(e)
+                } else {
+                    RunErr::Fatal(e)
+                }
+            })?;
+
+        let has_calls = completion.has_tool_calls();
+        if !has_calls || iteration == MAX_ITERATIONS {
+            if iteration == MAX_ITERATIONS && has_calls {
+                log::warn!(
+                    "[Agent] Reached max iterations ({}) with pending tool calls",
+                    MAX_ITERATIONS
+                );
+            }
+            // Model ignored native tools and answered in text-protocol form —
+            // hand off to the text loop (only safe before any tool has run).
+            if !has_calls
+                && parsed_servers.is_empty()
+                && !parse_tool_calls(&completion.content).is_empty()
+            {
+                return Err(RunErr::Fallback(
+                    "model used text [[TOOL]] protocol".to_string(),
+                ));
+            }
+            return Ok(AgentResult {
+                message: strip_tool_markers(&completion.content),
+                parsed_servers,
+            });
+        }
+
+        let calls = completion.tool_calls.clone().unwrap_or_default();
+        log::info!(
+            "[Agent] (native) Iteration {}/{}: {} tool call(s)",
+            iteration + 1,
+            MAX_ITERATIONS,
+            calls.len()
+        );
+
+        // Assistant turn carrying the native tool calls.
+        thread.push(ChatMessage::assistant_tool_calls(
+            completion.content.clone(),
+            calls.clone(),
+        ));
+
+        // One `tool` reply per call, keyed by tool_call_id.
+        for call in &calls {
+            let name = call.function.name.as_str();
+            if !ALLOWED_TOOLS.contains(&name) {
+                log::warn!("[Agent] Blocked non-allowlisted tool: {}", name);
+                thread.push(ChatMessage::tool(
+                    call.id.clone(),
+                    format!(
+                        "策略拦截：该工具不在 allowlist 中。允许的工具：{}",
+                        ALLOWED_TOOLS.join(", ")
+                    ),
+                ));
+                continue;
+            }
+            let arg_text = native_args_to_text(name, &call.function.arguments);
+            log::info!("[Agent] (native) Executing: {}", name);
+            let exec = execute_tool(name, &arg_text, sub_converter).await;
+            parsed_servers.extend(exec.servers);
+            thread.push(ChatMessage::tool(call.id.clone(), exec.text));
+        }
+    }
+
+    Ok(AgentResult {
+        message: String::new(),
+        parsed_servers,
+    })
+}
+
+/// Text-protocol loop (fallback): the original `[[TOOL:...]]` regex protocol with
+/// results injected as a single `user` turn. Used when the endpoint can't do
+/// native function calling.
+async fn run_text(
     ai: &AiService,
     base_url: &str,
     api_key: &str,
@@ -63,7 +185,7 @@ pub async fn run(
         }
 
         log::info!(
-            "[Agent] Iteration {}/{}: {} tool call(s)",
+            "[Agent] (text) Iteration {}/{}: {} tool call(s)",
             iteration + 1,
             MAX_ITERATIONS,
             tool_calls.len()
@@ -88,14 +210,7 @@ pub async fn run(
 
             log::info!("[Agent] Executing: {}({} chars of args)", name, args.len());
             let exec = execute_tool(name, args, sub_converter).await;
-            let server_count = exec.servers.len();
             parsed_servers.extend(exec.servers);
-
-            log::info!(
-                "[Agent] Tool {} done, {} server(s) parsed",
-                name,
-                server_count
-            );
             results_text.push_str(&format!(
                 "\n[TOOL_RESULT: {name}]\n{}\n[/TOOL_RESULT]\n",
                 exec.text
@@ -111,6 +226,76 @@ pub async fn run(
         message: String::new(),
         parsed_servers,
     })
+}
+
+// ── Native-mode helpers ───────────────────────────────────────────────────────
+
+/// JSON-Schema tool definitions advertised to the model in native mode. Mirrors
+/// the text-protocol allowlist in `ALLOWED_TOOLS`.
+fn tool_specs() -> Vec<ToolSpec> {
+    let url_schema = serde_json::json!({
+        "type": "object",
+        "properties": { "url": { "type": "string", "description": "订阅链接 URL" } },
+        "required": ["url"]
+    });
+    vec![
+        ToolSpec::function(
+            "fetch_subscription",
+            "拉取并解析订阅链接，返回解析出的节点列表",
+            url_schema.clone(),
+        ),
+        ToolSpec::function(
+            "convert_subscription",
+            "用 subconverter 转换 Clash 等格式的订阅链接",
+            url_schema,
+        ),
+        ToolSpec::function(
+            "subconverter_status",
+            "查看本地 subconverter 的安装与运行状态",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        ),
+        ToolSpec::function(
+            "parse_proxy_links",
+            "解析 vmess:// vless:// trojan:// ss:// 等代理分享链接",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "links": {
+                        "type": "string",
+                        "description": "一个或多个分享链接，使用空格或换行分隔"
+                    }
+                },
+                "required": ["links"]
+            }),
+        ),
+    ]
+}
+
+/// Map a native tool call's JSON `arguments` to the single string argument the
+/// `execute_tool` dispatcher expects. Falls back to the raw (trimmed) string when
+/// `arguments` isn't valid JSON, so a model that passes a bare value still works.
+fn native_args_to_text(name: &str, arguments: &str) -> String {
+    let value: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(_) => return arguments.trim().to_string(),
+    };
+    let key = match name {
+        "fetch_subscription" | "convert_subscription" => "url",
+        "parse_proxy_links" => "links",
+        _ => return String::new(),
+    };
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Heuristic for the native→text fallback: a 4xx API error almost always means
+/// the endpoint rejected the `tools` field. Network errors and 5xx are *not*
+/// fallback-worthy — retrying in text mode wouldn't help.
+fn should_fallback_to_text(err: &str) -> bool {
+    err.contains("API error (4")
 }
 
 // ── Tool Execution ────────────────────────────────────────────────────────────
@@ -551,5 +736,73 @@ mod tests {
         }
         assert!(!ALLOWED_TOOLS.contains(&"start_core"));
         assert!(!ALLOWED_TOOLS.contains(&"shell"));
+    }
+
+    // ── Native-mode helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn tool_specs_cover_the_allowlist() {
+        let specs = tool_specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
+        assert_eq!(specs.len(), ALLOWED_TOOLS.len());
+        for t in ALLOWED_TOOLS {
+            assert!(names.contains(t), "missing tool spec for {t}");
+        }
+    }
+
+    #[test]
+    fn tool_specs_have_object_schema() {
+        for spec in tool_specs() {
+            assert_eq!(spec.spec_type, "function");
+            assert_eq!(spec.function.parameters["type"], "object");
+        }
+    }
+
+    #[test]
+    fn native_args_extracts_url_param() {
+        assert_eq!(
+            native_args_to_text("fetch_subscription", r#"{"url":"https://x.com/sub"}"#),
+            "https://x.com/sub"
+        );
+        assert_eq!(
+            native_args_to_text("convert_subscription", r#"{"url":"https://y.com"}"#),
+            "https://y.com"
+        );
+    }
+
+    #[test]
+    fn native_args_extracts_links_param() {
+        assert_eq!(
+            native_args_to_text("parse_proxy_links", r#"{"links":"vmess://a\nvless://b"}"#),
+            "vmess://a\nvless://b"
+        );
+    }
+
+    #[test]
+    fn native_args_status_tool_takes_no_args() {
+        assert_eq!(native_args_to_text("subconverter_status", "{}"), "");
+    }
+
+    #[test]
+    fn native_args_missing_key_yields_empty() {
+        assert_eq!(native_args_to_text("fetch_subscription", "{}"), "");
+    }
+
+    #[test]
+    fn native_args_non_json_falls_back_to_raw() {
+        // Some models pass a bare value instead of a JSON object.
+        assert_eq!(
+            native_args_to_text("fetch_subscription", "https://raw.example.com"),
+            "https://raw.example.com"
+        );
+    }
+
+    #[test]
+    fn fallback_triggers_on_4xx_only() {
+        assert!(should_fallback_to_text("API error (400): 'tools' not supported"));
+        assert!(should_fallback_to_text("API error (404): not found"));
+        assert!(should_fallback_to_text("API error (422): unprocessable"));
+        assert!(!should_fallback_to_text("API error (500): internal error"));
+        assert!(!should_fallback_to_text("Request failed: connection refused"));
     }
 }
