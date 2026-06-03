@@ -70,10 +70,7 @@ pub async fn run(
         );
 
         // Assistant turn with the tool call text
-        thread.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: response,
-        });
+        thread.push(ChatMessage::assistant(response));
 
         // Execute each tool and collect results into a single user turn
         let mut results_text =
@@ -106,10 +103,7 @@ pub async fn run(
         }
 
         // Feed results back as a user turn so the next iteration sees them
-        thread.push(ChatMessage {
-            role: "user".to_string(),
-            content: results_text,
-        });
+        thread.push(ChatMessage::user(results_text));
     }
 
     // Should be unreachable but satisfy the compiler

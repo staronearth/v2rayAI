@@ -1,11 +1,9 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
+// Re-exported so existing `ai_service::ChatMessage` paths keep working while the
+// canonical definition lives in `types`.
+pub use crate::types::ChatMessage;
 
 #[derive(Debug, Serialize)]
 struct ApiRequest {

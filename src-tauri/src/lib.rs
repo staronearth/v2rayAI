@@ -11,6 +11,7 @@ mod secure_store;
 mod sub_converter;
 mod sys_proxy;
 mod traffic_monitor;
+mod types;
 
 use agent::AgentResult;
 use ai_service::{AiService, ChatMessage};
@@ -116,7 +117,7 @@ fn generate_conv_title(messages: Vec<ChatMessage>) -> String {
     let hist_msgs: Vec<chat_history::ChatMessage> = messages
         .iter()
         .map(|m| chat_history::ChatMessage {
-            role: m.role.clone(),
+            role: m.role.as_str().to_string(),
             content: m.content.clone(),
             timestamp: 0,
         })
@@ -304,15 +305,9 @@ async fn chat_with_ai(
     // ── Assemble the full message thread ─────────────────────────────────────
     // [system] → [history turns] → [current user message]
     let mut thread = Vec::with_capacity(history.len() + 2);
-    thread.push(ChatMessage {
-        role: "system".to_string(),
-        content: system_content,
-    });
+    thread.push(ChatMessage::system(system_content));
     thread.extend(history);
-    thread.push(ChatMessage {
-        role: "user".to_string(),
-        content: message,
-    });
+    thread.push(ChatMessage::user(message));
 
     // ── Run agentic loop ──────────────────────────────────────────────────────
     agent::run(
