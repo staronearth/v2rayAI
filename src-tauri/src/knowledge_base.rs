@@ -153,12 +153,64 @@ impl KnowledgeBase {
     }
 }
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| w.len() > 1)
-        .map(|w| w.to_string())
-        .collect()
+/// Tokenize a query/text for keyword matching. Shared by document and history RAG.
+///
+/// ASCII alphanumeric words are kept whole (lowercased, length > 1). Runs of CJK
+/// characters are split into overlapping bigrams so that *unspaced* Chinese — the
+/// common case — still yields matchable tokens; a lone CJK char is emitted as-is.
+/// Without this, `is_alphanumeric()` treats a whole Chinese phrase as one token
+/// that almost never `contains`-matches, so Chinese retrieval silently failed.
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut ascii = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+
+    for c in lower.chars() {
+        if is_cjk(c) {
+            flush_ascii(&mut ascii, &mut tokens);
+            cjk.push(c);
+        } else if c.is_alphanumeric() || c == '_' || c == '-' {
+            flush_cjk(&mut cjk, &mut tokens);
+            ascii.push(c);
+        } else {
+            flush_ascii(&mut ascii, &mut tokens);
+            flush_cjk(&mut cjk, &mut tokens);
+        }
+    }
+    flush_ascii(&mut ascii, &mut tokens);
+    flush_cjk(&mut cjk, &mut tokens);
+    tokens
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4dbf}'   // CJK Extension A
+        | '\u{4e00}'..='\u{9fff}' // CJK Unified Ideographs
+        | '\u{f900}'..='\u{faff}' // CJK Compatibility Ideographs
+    )
+}
+
+/// Flush a buffered ASCII word — kept only if longer than one character.
+fn flush_ascii(ascii: &mut String, tokens: &mut Vec<String>) {
+    if ascii.chars().count() > 1 {
+        tokens.push(ascii.clone());
+    }
+    ascii.clear();
+}
+
+/// Flush a buffered CJK run as overlapping bigrams (or a single char if len 1).
+fn flush_cjk(cjk: &mut Vec<char>, tokens: &mut Vec<String>) {
+    match cjk.len() {
+        0 => {}
+        1 => tokens.push(cjk[0].to_string()),
+        _ => {
+            for w in cjk.windows(2) {
+                tokens.push(w.iter().collect());
+            }
+        }
+    }
+    cjk.clear();
 }
 
 fn score_chunk(chunk: &DocChunk, query_terms: &[String]) -> f32 {
@@ -726,4 +778,66 @@ openssl rand -hex 8
 ```"#.into(),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_lowercases_ascii_words() {
+        assert_eq!(tokenize("VLESS Reality"), vec!["vless", "reality"]);
+    }
+
+    #[test]
+    fn tokenize_drops_single_ascii_chars() {
+        // Length-1 ASCII tokens are noise and dropped (preserves prior behavior).
+        assert_eq!(tokenize("a bc d"), vec!["bc"]);
+    }
+
+    #[test]
+    fn tokenize_unspaced_chinese_into_bigrams() {
+        assert_eq!(tokenize("怎么配置"), vec!["怎么", "么配", "配置"]);
+    }
+
+    #[test]
+    fn tokenize_mixed_chinese_and_ascii() {
+        assert_eq!(tokenize("vless怎么配"), vec!["vless", "怎么", "么配"]);
+    }
+
+    #[test]
+    fn tokenize_single_cjk_char_kept() {
+        assert_eq!(tokenize("好"), vec!["好"]);
+    }
+
+    #[test]
+    fn tokenize_empty_input() {
+        assert!(tokenize("   ,.! ").is_empty());
+    }
+
+    #[test]
+    fn chinese_query_now_scores_against_chinese_chunk() {
+        // Regression: before bigram tokenization this scored 0.
+        let chunk = DocChunk {
+            id: "t".into(),
+            source: "test".into(),
+            title: "测试".into(),
+            content: "如何配置 VLESS 节点的 REALITY 参数".into(),
+            keywords: vec![],
+            embedding: None,
+        };
+        let terms = tokenize("配置节点");
+        assert!(score_chunk(&chunk, &terms) > 0.0);
+    }
+
+    #[test]
+    fn search_finds_chinese_query() {
+        let kb = KnowledgeBase {
+            xray_version: "test".into(),
+            built_at: 0,
+            chunks: get_builtin_chunks(),
+        };
+        let hits = kb.search("如何配置 reality", 3);
+        assert!(!hits.is_empty());
+    }
 }

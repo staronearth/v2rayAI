@@ -218,15 +218,6 @@ pub struct HistoryChunk {
     pub score: f32,
 }
 
-/// Tokenise text into lowercase alphanumeric tokens (same strategy as knowledge_base).
-fn rag_tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| w.len() > 1)
-        .map(|w| w.to_string())
-        .collect()
-}
-
 /// Technical keyword list shared with knowledge_base scoring logic.
 const TECH_KEYWORDS: &[&str] = &[
     "vless",
@@ -299,7 +290,7 @@ pub async fn search_history_rag(
     let dir = history_dir();
     fs::create_dir_all(&dir).await.ok();
 
-    let query_terms = rag_tokenize(query);
+    let query_terms = crate::knowledge_base::tokenize(query);
     if query_terms.is_empty() {
         return vec![];
     }
