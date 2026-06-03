@@ -19,7 +19,7 @@ use app_logger::LogEntry;
 use chat_history::{
     auto_title, delete_conversation, format_history_rag_context, list_conversations,
     load_conversation, save_conversation, search_conversations, search_history_rag, Conversation,
-    ConversationMeta,
+    ConversationMeta, HistoryCache,
 };
 use config_generator::{parse_share_link, parse_subscription, ServerConfig};
 use config_manager::{ConfigManager, SavedConfig};
@@ -45,6 +45,7 @@ pub struct AppState {
     pub health_monitor: HealthMonitor,
     pub knowledge_base: Arc<Mutex<KnowledgeBase>>,
     pub sub_converter: Arc<SubConverterManager>,
+    pub history_cache: Arc<Mutex<HistoryCache>>,
 }
 
 // ── App Logger ────────────────────────────────────────────────────────────────
@@ -310,7 +311,7 @@ async fn chat_with_ai(
             let kb = state.knowledge_base.lock().await;
             kb.get_rag_context(&message, 4, query_embedding.as_deref())
         },
-        search_history_rag(&message, 3, 600),
+        search_history_rag(&state.history_cache, &message, 3, 600),
     );
     let hist_rag = format_history_rag_context(&hist_chunks);
 
@@ -350,8 +351,9 @@ pub struct HistoryRagResult {
 async fn search_history_knowledge(
     query: String,
     top_k: Option<usize>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<HistoryRagResult>, String> {
-    let chunks = search_history_rag(&query, top_k.unwrap_or(5), 600).await;
+    let chunks = search_history_rag(&state.history_cache, &query, top_k.unwrap_or(5), 600).await;
     Ok(chunks
         .into_iter()
         .map(|c| HistoryRagResult {
@@ -725,6 +727,7 @@ pub fn run() {
         health_monitor: HealthMonitor::new(),
         knowledge_base: Arc::new(Mutex::new(kb)),
         sub_converter: Arc::new(SubConverterManager::new()),
+        history_cache: Arc::new(Mutex::new(HistoryCache::default())),
     };
 
     tauri::Builder::default()

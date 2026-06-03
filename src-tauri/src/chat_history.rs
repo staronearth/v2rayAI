@@ -1,7 +1,9 @@
 /// Persistent chat history storage
 /// Stores conversations as JSON files in ~/.v2rayai/history/
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tokio::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,47 +284,96 @@ fn rag_score(text: &str, query_terms: &[String]) -> f32 {
 /// Search all saved conversation files and return the top-k most relevant snippets.
 /// Each snippet contains the best-matching message plus the adjacent message for context.
 /// Maximum snippet length is capped at `max_snippet_chars` characters.
-pub async fn search_history_rag(
-    query: &str,
-    top_k: usize,
-    max_snippet_chars: usize,
-) -> Vec<HistoryChunk> {
-    let dir = history_dir();
-    fs::create_dir_all(&dir).await.ok();
+/// A conversation message reduced to what history RAG needs: role (for the
+/// snippet label) and content (for scoring + snippet text).
+struct CachedMsg {
+    role: String,
+    content: String,
+}
 
-    let query_terms = crate::knowledge_base::tokenize(query);
-    if query_terms.is_empty() {
-        return vec![];
+/// One cached conversation, keyed in the cache by its file stem (== conv id).
+struct CachedConv {
+    mtime: SystemTime,
+    title: String,
+    messages: Vec<CachedMsg>,
+}
+
+/// In-memory, mtime-validated cache of conversation files. Avoids re-reading and
+/// re-deserializing every history file on each search — the original hot path.
+/// Lives in `AppState`; entries are refreshed lazily from disk on each search,
+/// so saves/deletes need no explicit cache invalidation.
+#[derive(Default)]
+pub struct HistoryCache {
+    entries: HashMap<String, CachedConv>,
+}
+
+impl HistoryCache {
+    /// Sync the cache with `dir` by file mtime: only new/changed files are read
+    /// and deserialized; deleted files are dropped.
+    async fn refresh(&mut self, dir: &Path) {
+        let mut read_dir = match fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if !file_name.ends_with(".json") {
+                continue;
+            }
+            let id = file_name.trim_end_matches(".json").to_string();
+            seen.insert(id.clone());
+
+            let mtime = match entry.metadata().await.and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            // Unchanged since last cached → skip the read/parse.
+            if self.entries.get(&id).map(|c| c.mtime) == Some(mtime) {
+                continue;
+            }
+            let bytes = match fs::read(entry.path()).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let conv: Conversation = match serde_json::from_slice(&bytes) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            self.entries.insert(
+                id,
+                CachedConv {
+                    mtime,
+                    title: conv.title,
+                    messages: conv
+                        .messages
+                        .into_iter()
+                        .map(|m| CachedMsg {
+                            role: m.role,
+                            content: m.content,
+                        })
+                        .collect(),
+                },
+            );
+        }
+        // Drop entries whose files no longer exist.
+        self.entries.retain(|k, _| seen.contains(k));
     }
 
-    let mut entries = match fs::read_dir(&dir).await {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
+    /// Score every cached conversation against `query_terms` and return the
+    /// top-k snippets. Pure and in-memory (no IO) — the testable core.
+    fn search(
+        &self,
+        query_terms: &[String],
+        top_k: usize,
+        max_snippet_chars: usize,
+    ) -> Vec<HistoryChunk> {
+        let mut results: Vec<HistoryChunk> = Vec::new();
 
-    let mut results: Vec<HistoryChunk> = Vec::new();
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        if !name.to_string_lossy().ends_with(".json") {
-            continue;
-        }
-
-        let bytes = match fs::read(entry.path()).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let conv: Conversation = match serde_json::from_slice(&bytes) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // Score every message, find the best one
-        let mut best_score = 0.0f32;
-        let mut best_idx = 0usize;
-
-        for (i, msg) in conv.messages.iter().enumerate() {
-            // Title gets 3× weight for query term match
+        for (id, conv) in &self.entries {
+            // Title match gives a per-conversation bonus.
             let title_bonus = if conv
                 .title
                 .to_lowercase()
@@ -334,49 +385,72 @@ pub async fn search_history_rag(
                 0.0
             };
 
-            let s = rag_score(&msg.content, &query_terms) + title_bonus;
-            if s > best_score {
-                best_score = s;
-                best_idx = i;
+            let mut best_score = 0.0f32;
+            let mut best_idx = 0usize;
+            for (i, msg) in conv.messages.iter().enumerate() {
+                let s = rag_score(&msg.content, query_terms) + title_bonus;
+                if s > best_score {
+                    best_score = s;
+                    best_idx = i;
+                }
             }
+            if best_score <= 0.0 {
+                continue;
+            }
+
+            // Snippet: best message ± 1 adjacent message for context.
+            let start = best_idx.saturating_sub(1);
+            let end = (best_idx + 2).min(conv.messages.len());
+            let snippet_parts: Vec<String> = conv.messages[start..end]
+                .iter()
+                .map(|m| {
+                    let role_label = if m.role == "user" { "用户" } else { "助手" };
+                    let content: String = m.content.chars().take(max_snippet_chars / 2).collect();
+                    let ellipsis = if m.content.len() > max_snippet_chars / 2 {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    format!("**[{}]**: {}{}", role_label, content, ellipsis)
+                })
+                .collect();
+
+            results.push(HistoryChunk {
+                conv_title: conv.title.clone(),
+                conv_id: id.clone(),
+                snippet: snippet_parts.join("\n\n"),
+                score: best_score,
+            });
         }
 
-        if best_score <= 0.0 {
-            continue;
-        }
-
-        // Build snippet: best message ± 1 adjacent message for context
-        let start = best_idx.saturating_sub(1);
-        let end = (best_idx + 2).min(conv.messages.len());
-        let snippet_parts: Vec<String> = conv.messages[start..end]
-            .iter()
-            .map(|m| {
-                let role_label = if m.role == "user" { "用户" } else { "助手" };
-                let content: String = m.content.chars().take(max_snippet_chars / 2).collect();
-                let ellipsis = if m.content.len() > max_snippet_chars / 2 {
-                    "…"
-                } else {
-                    ""
-                };
-                format!("**[{}]**: {}{}", role_label, content, ellipsis)
-            })
-            .collect();
-
-        results.push(HistoryChunk {
-            conv_title: conv.title.clone(),
-            conv_id: conv.id.clone(),
-            snippet: snippet_parts.join("\n\n"),
-            score: best_score,
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
+        results.into_iter().take(top_k).collect()
+    }
+}
+
+/// Search saved conversations for the top-k snippets relevant to `query`, using
+/// an mtime-validated in-memory cache to avoid re-reading unchanged files.
+pub async fn search_history_rag(
+    cache: &tokio::sync::Mutex<HistoryCache>,
+    query: &str,
+    top_k: usize,
+    max_snippet_chars: usize,
+) -> Vec<HistoryChunk> {
+    let query_terms = crate::knowledge_base::tokenize(query);
+    if query_terms.is_empty() {
+        return vec![];
     }
 
-    // Sort by score descending, return top-k
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results.into_iter().take(top_k).collect()
+    let dir = history_dir();
+    fs::create_dir_all(&dir).await.ok();
+
+    let mut guard = cache.lock().await;
+    guard.refresh(&dir).await;
+    guard.search(&query_terms, top_k, max_snippet_chars)
 }
 
 /// Format history RAG chunks as a Markdown context block for AI prompt injection.
@@ -393,4 +467,80 @@ pub fn format_history_rag_context(chunks: &[HistoryChunk]) -> String {
     }
     ctx.push_str("---\n");
     ctx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with(convs: Vec<(&str, &str, Vec<(&str, &str)>)>) -> HistoryCache {
+        let mut cache = HistoryCache::default();
+        for (id, title, msgs) in convs {
+            cache.entries.insert(
+                id.to_string(),
+                CachedConv {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    title: title.to_string(),
+                    messages: msgs
+                        .into_iter()
+                        .map(|(r, c)| CachedMsg {
+                            role: r.to_string(),
+                            content: c.to_string(),
+                        })
+                        .collect(),
+                },
+            );
+        }
+        cache
+    }
+
+    #[test]
+    fn search_ranks_relevant_and_drops_zero_scores() {
+        let cache = cache_with(vec![
+            (
+                "c1",
+                "VLESS 配置",
+                vec![
+                    ("user", "怎么配置 vless reality"),
+                    ("assistant", "用 flow xtls-rprx-vision"),
+                ],
+            ),
+            (
+                "c2",
+                "闲聊",
+                vec![("user", "今天天气如何"), ("assistant", "不清楚")],
+            ),
+        ]);
+        let terms = crate::knowledge_base::tokenize("vless reality 配置");
+        let hits = cache.search(&terms, 5, 600);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conv_id, "c1");
+        assert!(hits[0].score > 0.0);
+    }
+
+    #[test]
+    fn search_empty_cache_returns_empty() {
+        let cache = HistoryCache::default();
+        let terms = crate::knowledge_base::tokenize("vless");
+        assert!(cache.search(&terms, 5, 600).is_empty());
+    }
+
+    #[test]
+    fn search_snippet_includes_adjacent_message() {
+        let cache = cache_with(vec![(
+            "c1",
+            "T",
+            vec![
+                ("user", "前一条无关消息"),
+                ("user", "vless 怎么配置"),
+                ("assistant", "后一条答案"),
+            ],
+        )]);
+        let terms = crate::knowledge_base::tokenize("vless");
+        let hits = cache.search(&terms, 5, 600);
+        assert_eq!(hits.len(), 1);
+        // Best match is index 1; snippet spans index 0..3 for context.
+        assert!(hits[0].snippet.contains("vless 怎么配置"));
+        assert!(hits[0].snippet.contains("后一条答案"));
+    }
 }
