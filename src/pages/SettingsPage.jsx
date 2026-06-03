@@ -13,7 +13,8 @@ const PROVIDER_PRESETS = {
     baseUrl: 'https://api.deepseek.com',
     model: 'deepseek-chat',
     keyPlaceholder: 'sk-...',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    // deepseek-chat / deepseek-reasoner 将于 2026/07/24 弃用，迁移至 v4 系列
+    models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
   },
   ollama: {
     baseUrl: 'http://localhost:11434/v1',
