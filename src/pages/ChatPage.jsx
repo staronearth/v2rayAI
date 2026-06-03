@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useRef, useEffect, useCallback } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, Channel } from '@tauri-apps/api/core'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -161,10 +161,29 @@ export default function ChatPage({
       setConvTitle(title)
     }
 
+    // Streaming: a placeholder assistant message is updated as fragments arrive.
+    let streamed = ''
+    const channel = new Channel()
+    channel.onmessage = (delta) => {
+      streamed += delta
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last && last.role === 'assistant' && last.streaming) {
+          next[next.length - 1] = { ...last, content: streamed }
+        }
+        return next
+      })
+    }
+    setMessages([...newMessages, {
+      role: 'assistant', content: '', timestamp: Date.now(), streaming: true, parsedServers: [],
+    }])
+
     try {
       const result = await invoke('chat_with_ai', {
         message,
         history: messages.map(m => ({ role: m.role, content: m.content })),
+        onEvent: channel,
         settings: {
           base_url: settings.aiBaseUrl,
           api_key: settings.aiApiKey,
@@ -203,8 +222,9 @@ export default function ChatPage({
         },
       })
 
-      // result is { message: string, parsedServers: ServerConfig[] }
-      const aiText = result.message
+      // Prefer streamed text (what the user saw); fall back to result.message
+      // for the non-streaming text-protocol path.
+      const aiText = streamed || result.message
       const assistantMsg = {
         role: 'assistant',
         content: aiText,
@@ -217,7 +237,7 @@ export default function ChatPage({
 
     } catch (e) {
       const errMsg = { role: 'assistant', content: `❌ 出错了: ${e}`, timestamp: Date.now() }
-      setMessages(prev => [...prev, errMsg])
+      setMessages([...newMessages, errMsg])
     } finally {
       setIsLoading(false)
     }
