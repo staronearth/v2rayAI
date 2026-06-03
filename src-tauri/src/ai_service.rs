@@ -76,6 +76,33 @@ fn extract_completion(resp: ApiResponse) -> Result<Completion, String> {
     })
 }
 
+// ── Embeddings ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct EmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+    #[serde(default)]
+    index: usize,
+}
+
+/// Order embeddings by their `index` (the API may return them out of order) and
+/// drop the indices.
+fn sort_embeddings(mut resp: EmbeddingResponse) -> Vec<Vec<f32>> {
+    resp.data.sort_by_key(|d| d.index);
+    resp.data.into_iter().map(|d| d.embedding).collect()
+}
+
 // ── Streaming (SSE) ─────────────────────────────────────────────────────────
 
 /// One meaningful event parsed from a single SSE line of the stream.
@@ -289,6 +316,44 @@ impl AiService {
 
         Ok(full)
     }
+
+    /// Compute embeddings for `inputs` via the OpenAI-compatible `/embeddings`
+    /// endpoint. Returns one vector per input, in input order.
+    pub async fn embeddings(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        inputs: &[String],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+        let headers = auth_headers(api_key)?;
+        let body = EmbeddingRequest {
+            model,
+            input: inputs,
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Embedding API error ({}): {}", status, body));
+        }
+
+        let parsed: EmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse embeddings: {}", e))?;
+        Ok(sort_embeddings(parsed))
+    }
 }
 
 fn auth_headers(api_key: &str) -> Result<HeaderMap, String> {
@@ -452,5 +517,18 @@ mod tests {
     fn sse_handles_crlf_line_ending() {
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n";
         assert_eq!(parse_sse_line(line), StreamEvent::Delta("x".to_string()));
+    }
+
+    #[test]
+    fn embeddings_returned_in_index_order() {
+        // The API may return data out of order; we sort by `index`.
+        let resp: EmbeddingResponse = serde_json::from_str(
+            r#"{ "data": [
+                { "embedding": [0.0, 1.0], "index": 1 },
+                { "embedding": [1.0, 0.0], "index": 0 }
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(sort_embeddings(resp), vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
     }
 }

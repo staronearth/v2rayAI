@@ -293,7 +293,9 @@ async fn chat_with_ai(
     let (doc_rag, hist_chunks) = tokio::join!(
         async {
             let kb = state.knowledge_base.lock().await;
-            kb.get_rag_context(&message, 4)
+            // query_embedding=None for now → keyword path; vector retrieval is
+            // enabled once embeddings are wired in the command layer (3b-2).
+            kb.get_rag_context(&message, 4, None)
         },
         search_history_rag(&message, 3, 600),
     );

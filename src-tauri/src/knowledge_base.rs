@@ -134,9 +134,19 @@ impl KnowledgeBase {
             .collect()
     }
 
-    /// Format top-k chunks as context string for AI prompt
-    pub fn get_rag_context(&self, query: &str, top_k: usize) -> String {
-        let chunks = self.search(query, top_k);
+    /// Format top-k chunks as context string for AI prompt. Uses vector search
+    /// when a `query_embedding` is supplied and chunks carry embeddings; otherwise
+    /// falls back to keyword TF-IDF.
+    pub fn get_rag_context(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_embedding: Option<&[f32]>,
+    ) -> String {
+        let chunks = match query_embedding {
+            Some(q) if self.has_embeddings() => self.search_vector(q, top_k),
+            _ => self.search(query, top_k),
+        };
         if chunks.is_empty() {
             return String::new();
         }
@@ -151,6 +161,71 @@ impl KnowledgeBase {
         ctx.push_str("---\n");
         ctx
     }
+
+    /// True if any chunk has a precomputed embedding.
+    pub fn has_embeddings(&self) -> bool {
+        self.chunks.iter().any(|c| c.embedding.is_some())
+    }
+
+    /// Rank chunks that have embeddings by cosine similarity to `query`.
+    fn search_vector(&self, query: &[f32], top_k: usize) -> Vec<&DocChunk> {
+        let mut scored: Vec<(&DocChunk, f32)> = self
+            .chunks
+            .iter()
+            .filter_map(|c| c.embedding.as_ref().map(|e| (c, cosine_similarity(query, e))))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(top_k).map(|(c, _)| c).collect()
+    }
+
+    /// Compute and store an embedding for every chunk via the embedding API, then
+    /// persist. Enables vector search on subsequent queries.
+    pub async fn embed_chunks(
+        &mut self,
+        ai: &crate::ai_service::AiService,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Result<usize, String> {
+        let inputs: Vec<String> = self
+            .chunks
+            .iter()
+            .map(|c| format!("{}\n{}", c.title, c.content))
+            .collect();
+        let vectors = ai.embeddings(base_url, api_key, model, &inputs).await?;
+        if vectors.len() != self.chunks.len() {
+            return Err(format!(
+                "embedding 数量({})与文档块数量({})不匹配",
+                vectors.len(),
+                self.chunks.len()
+            ));
+        }
+        for (chunk, v) in self.chunks.iter_mut().zip(vectors) {
+            chunk.embedding = Some(v);
+        }
+        self.save().await?;
+        Ok(self.chunks.len())
+    }
+}
+
+/// Cosine similarity of two equal-length vectors. Returns 0.0 for
+/// mismatched-length, empty, or zero-magnitude inputs.
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 /// Tokenize a query/text for keyword matching. Shared by document and history RAG.
@@ -839,5 +914,61 @@ mod tests {
         };
         let hits = kb.search("如何配置 reality", 3);
         assert!(!hits.is_empty());
+    }
+
+    // ── Embedding / vector search ───────────────────────────────────────────
+
+    #[test]
+    fn cosine_identical_vectors_is_one() {
+        let v = [1.0, 2.0, 3.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_is_zero() {
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_guards_mismatched_empty_and_zero() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn vector_search_ranks_by_cosine() {
+        let mk = |id: &str, emb: Vec<f32>| DocChunk {
+            id: id.into(),
+            source: "s".into(),
+            title: "t".into(),
+            content: "c".into(),
+            keywords: vec![],
+            embedding: Some(emb),
+        };
+        let kb = KnowledgeBase {
+            xray_version: "t".into(),
+            built_at: 0,
+            chunks: vec![
+                mk("a", vec![1.0, 0.0]),
+                mk("b", vec![0.0, 1.0]),
+                mk("c", vec![0.9, 0.1]),
+            ],
+        };
+        let hits = kb.search_vector(&[1.0, 0.0], 2);
+        assert_eq!(hits[0].id, "a");
+        assert_eq!(hits[1].id, "c");
+    }
+
+    #[test]
+    fn rag_context_falls_back_to_keywords_without_embedding() {
+        let kb = KnowledgeBase {
+            xray_version: "t".into(),
+            built_at: 0,
+            chunks: get_builtin_chunks(),
+        };
+        // No query embedding (and builtin chunks have none) → keyword path.
+        let ctx = kb.get_rag_context("reality", 2, None);
+        assert!(ctx.contains("RAG"));
     }
 }
