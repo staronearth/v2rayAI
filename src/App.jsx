@@ -86,6 +86,7 @@ const DEFAULT_SETTINGS = {
   allowLan: false,
   routingMode: 'rule',
   language: 'zh',
+  aiEmbeddingModel: '',
 }
 
 function genChatId() {

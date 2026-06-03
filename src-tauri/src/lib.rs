@@ -132,6 +132,9 @@ pub struct AiSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Optional embedding model; when set, enables vector RAG retrieval.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -289,13 +292,23 @@ async fn chat_with_ai(
     context: Option<ConnectionContext>,
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
+    // ── If an embedding model is configured, compute the query vector so the
+    //    document RAG can use vector search (falls back to keywords on error). ──
+    let query_embedding = match settings.embedding_model.as_deref().filter(|m| !m.is_empty()) {
+        Some(em) => state
+            .ai_service
+            .embeddings(&settings.base_url, &settings.api_key, em, &[message.clone()])
+            .await
+            .ok()
+            .and_then(|mut v| v.pop()),
+        None => None,
+    };
+
     // ── Dual RAG: document search + history search (concurrent) ──────────────
     let (doc_rag, hist_chunks) = tokio::join!(
         async {
             let kb = state.knowledge_base.lock().await;
-            // query_embedding=None for now → keyword path; vector retrieval is
-            // enabled once embeddings are wired in the command layer (3b-2).
-            kb.get_rag_context(&message, 4, None)
+            kb.get_rag_context(&message, 4, query_embedding.as_deref())
         },
         search_history_rag(&message, 3, 600),
     );
@@ -362,6 +375,23 @@ async fn refresh_knowledge_base(
     kb.xray_version = xray_version;
     kb.save().await?;
     Ok(kb.chunks.len())
+}
+
+/// Compute and cache embeddings for every knowledge-base chunk, enabling vector
+/// RAG retrieval. Requires `embedding_model` to be set in the AI settings.
+#[tauri::command]
+async fn embed_knowledge_base(
+    settings: AiSettings,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let model = settings
+        .embedding_model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .ok_or("未配置 embedding 模型")?;
+    let mut kb = state.knowledge_base.lock().await;
+    kb.embed_chunks(&state.ai_service, &settings.base_url, &settings.api_key, model)
+        .await
 }
 
 #[tauri::command]
@@ -719,6 +749,7 @@ pub fn run() {
             chat_with_ai,
             search_history_knowledge,
             refresh_knowledge_base,
+            embed_knowledge_base,
             search_knowledge,
             parse_proxy_link,
             parse_subscription_content,

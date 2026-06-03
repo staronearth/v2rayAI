@@ -37,6 +37,8 @@ export default function SettingsPage({ settings, setSettings }) {
   const [coreLoading, setCoreLoading] = useState('')
   const [coreError, setCoreError] = useState('')
   const [resolveResult, setResolveResult] = useState(null)
+  const [embedResult, setEmbedResult] = useState(null)
+  const [embedLoading, setEmbedLoading] = useState(false)
 
   const updateSetting = (key, value) => {
     setSettings(prev => ({ ...prev, [key]: value }))
@@ -60,6 +62,30 @@ export default function SettingsPage({ settings, setSettings }) {
   const handleSave = () => {
     setSavedToast(true)
     setTimeout(() => setSavedToast(false), 2000)
+  }
+
+  const handleBuildEmbeddings = async () => {
+    if (!settings.aiEmbeddingModel) {
+      setEmbedResult({ ok: false, message: '请先填写 Embedding 模型名' })
+      return
+    }
+    setEmbedLoading(true)
+    setEmbedResult(null)
+    try {
+      const count = await invoke('embed_knowledge_base', {
+        settings: {
+          base_url: settings.aiBaseUrl,
+          api_key: settings.aiApiKey,
+          model: settings.aiModel,
+          embedding_model: settings.aiEmbeddingModel,
+        },
+      })
+      setEmbedResult({ ok: true, message: `✅ 已为 ${count} 个文档块构建向量索引` })
+    } catch (e) {
+      setEmbedResult({ ok: false, message: `❌ 构建失败: ${e}` })
+    } finally {
+      setEmbedLoading(false)
+    }
   }
 
   const handleTestConnection = async () => {
@@ -257,6 +283,39 @@ export default function SettingsPage({ settings, setSettings }) {
                   style={{ marginTop: 'var(--space-sm)' }}
                   id="ai-model-custom-input"
                 />
+              )}
+            </div>
+
+            <div className="settings-field">
+              <label className="settings-label">Embedding 模型（可选，启用向量检索）</label>
+              <input
+                className="settings-input"
+                placeholder="如 text-embedding-3-small，留空则用关键词检索"
+                value={settings.aiEmbeddingModel || ''}
+                onChange={e => updateSetting('aiEmbeddingModel', e.target.value)}
+                id="ai-embedding-model-input"
+              />
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleBuildEmbeddings}
+                disabled={embedLoading}
+                style={{ marginTop: 'var(--space-sm)' }}
+                id="build-embeddings-btn"
+              >
+                {embedLoading ? '⏳ 构建中...' : '🧮 构建向量索引'}
+              </button>
+              {embedResult && (
+                <div style={{
+                  marginTop: 'var(--space-sm)',
+                  padding: '6px 12px',
+                  borderRadius: 'var(--radius-sm)',
+                  fontSize: 'var(--font-size-sm)',
+                  background: embedResult.ok ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                  color: embedResult.ok ? '#4ade80' : '#f87171',
+                  border: `1px solid ${embedResult.ok ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                }}>
+                  {embedResult.message}
+                </div>
               )}
             </div>
 

@@ -169,6 +169,7 @@ export default function ChatPage({
           base_url: settings.aiBaseUrl,
           api_key: settings.aiApiKey,
           model: settings.aiModel,
+          embedding_model: settings.aiEmbeddingModel || null,
         },
         context: {
           server_name: activeServer?.name || null,
