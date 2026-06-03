@@ -37,18 +37,33 @@ pub struct AgentResult {
 /// native tool calls.
 ///
 /// `thread` is the full conversation history including the current user turn.
-pub async fn run(
+/// `on_delta` is called with each text fragment as the native path streams; the
+/// returned `AgentResult.message` remains the authoritative final text (used as
+/// fallback when nothing was streamed, e.g. the text-protocol path).
+pub async fn run<F: FnMut(&str)>(
     ai: &AiService,
     base_url: &str,
     api_key: &str,
     model: &str,
     thread: Vec<ChatMessage>,
     sub_converter: &SubConverterManager,
+    mut on_delta: F,
 ) -> Result<AgentResult, String> {
-    match run_native(ai, base_url, api_key, model, thread.clone(), sub_converter).await {
+    match run_native(
+        ai,
+        base_url,
+        api_key,
+        model,
+        thread.clone(),
+        sub_converter,
+        &mut on_delta,
+    )
+    .await
+    {
         Ok(result) => Ok(result),
         Err(RunErr::Fallback(reason)) => {
             log::warn!("[Agent] Falling back to text protocol: {reason}");
+            // The text path is non-streaming; the final message is returned whole.
             run_text(ai, base_url, api_key, model, thread, sub_converter).await
         }
         Err(RunErr::Fatal(e)) => Err(e),
@@ -64,20 +79,28 @@ enum RunErr {
 
 /// Native function-calling loop: advertise tools, consume `tool_calls`, and feed
 /// each result back as a `tool` message keyed by its `tool_call_id`.
-async fn run_native(
+async fn run_native<F: FnMut(&str)>(
     ai: &AiService,
     base_url: &str,
     api_key: &str,
     model: &str,
     mut thread: Vec<ChatMessage>,
     sub_converter: &SubConverterManager,
+    on_delta: &mut F,
 ) -> Result<AgentResult, RunErr> {
     let specs = tool_specs();
     let mut parsed_servers: Vec<ServerConfig> = Vec::new();
 
     for iteration in 0..=MAX_ITERATIONS {
         let completion = ai
-            .complete_with_tools(base_url, api_key, model, &thread, Some(&specs))
+            .complete_stream_with_tools(
+                base_url,
+                api_key,
+                model,
+                &thread,
+                Some(&specs),
+                |frag| on_delta(frag),
+            )
             .await
             .map_err(|e| {
                 if should_fallback_to_text(&e) {

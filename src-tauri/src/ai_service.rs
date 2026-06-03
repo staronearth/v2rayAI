@@ -105,11 +105,28 @@ fn sort_embeddings(mut resp: EmbeddingResponse) -> Vec<Vec<f32>> {
 
 // ── Streaming (SSE) ─────────────────────────────────────────────────────────
 
-/// One meaningful event parsed from a single SSE line of the stream.
+/// Parsed payload of a single streaming delta: a text fragment and/or fragments
+/// of one or more tool calls (which arrive split across many deltas).
+#[derive(Debug, Default, PartialEq)]
+struct ParsedDelta {
+    content: Option<String>,
+    tool_calls: Vec<ToolCallDelta>,
+}
+
+/// A fragment of a tool call within a streaming delta. `id`/`name` arrive once;
+/// `arguments` arrives as a string that must be concatenated across deltas.
+#[derive(Debug, PartialEq)]
+struct ToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// One meaningful event parsed from a single SSE line.
 #[derive(Debug, PartialEq)]
 enum StreamEvent {
-    /// A text content delta to append/emit.
-    Delta(String),
+    Delta(ParsedDelta),
     /// The `[DONE]` sentinel: stream is finished.
     Done,
     /// A line with nothing to emit (blank, comment, role-only delta, parse miss).
@@ -125,18 +142,38 @@ struct StreamChunk {
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
     #[serde(default)]
-    delta: StreamDelta,
+    delta: RawDelta,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct StreamDelta {
+struct RawDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<RawToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<RawFnDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFnDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// Parse one raw SSE line into a `StreamEvent`. Pure and total — unknown or
 /// malformed lines map to `Skip` rather than erroring, so a stray keep-alive
-/// or a tool-call delta never aborts the stream.
+/// never aborts the stream.
 fn parse_sse_line(line: &str) -> StreamEvent {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') {
@@ -153,9 +190,71 @@ fn parse_sse_line(line: &str) -> StreamEvent {
         Ok(c) => c,
         Err(_) => return StreamEvent::Skip,
     };
-    match chunk.choices.into_iter().next().and_then(|c| c.delta.content) {
-        Some(t) if !t.is_empty() => StreamEvent::Delta(t),
-        _ => StreamEvent::Skip,
+    let raw = match chunk.choices.into_iter().next() {
+        Some(c) => c.delta,
+        None => return StreamEvent::Skip,
+    };
+    let tool_calls: Vec<ToolCallDelta> = raw
+        .tool_calls
+        .into_iter()
+        .map(|t| ToolCallDelta {
+            index: t.index,
+            id: t.id,
+            name: t.function.as_ref().and_then(|f| f.name.clone()),
+            arguments: t.function.and_then(|f| f.arguments),
+        })
+        .collect();
+    let content = raw.content.filter(|c| !c.is_empty());
+    if content.is_none() && tool_calls.is_empty() {
+        return StreamEvent::Skip;
+    }
+    StreamEvent::Delta(ParsedDelta {
+        content,
+        tool_calls,
+    })
+}
+
+/// Accumulates streaming deltas into a final `Completion`, reassembling tool
+/// calls from their fragments (keyed by `index`).
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    tool_calls: Vec<ToolCall>,
+}
+
+impl StreamAccumulator {
+    /// Apply a delta; returns the content fragment to emit downstream, if any.
+    fn apply(&mut self, delta: ParsedDelta) -> Option<String> {
+        for tcd in delta.tool_calls {
+            while self.tool_calls.len() <= tcd.index {
+                self.tool_calls.push(ToolCall::function("", "", ""));
+            }
+            let tc = &mut self.tool_calls[tcd.index];
+            if let Some(id) = tcd.id {
+                tc.id = id;
+            }
+            if let Some(name) = tcd.name {
+                tc.function.name = name;
+            }
+            if let Some(args) = tcd.arguments {
+                tc.function.arguments.push_str(&args);
+            }
+        }
+        match delta.content {
+            Some(c) if !c.is_empty() => {
+                self.content.push_str(&c);
+                Some(c)
+            }
+            _ => None,
+        }
+    }
+
+    fn into_completion(self) -> Completion {
+        let has_tools = self.tool_calls.iter().any(|t| !t.function.name.is_empty());
+        Completion {
+            content: self.content,
+            tool_calls: if has_tools { Some(self.tool_calls) } else { None },
+        }
     }
 }
 
@@ -236,20 +335,22 @@ impl AiService {
         extract_completion(api_response)
     }
 
-    /// Stream a plain-text completion, invoking `on_delta` for each text chunk
-    /// as it arrives, and returning the fully assembled text at the end.
+    /// Stream a completion, optionally advertising `tools`, invoking `on_delta`
+    /// for each text fragment as it arrives, and returning the fully assembled
+    /// `Completion` (text + reassembled tool calls) at the end.
     ///
-    /// This is for text answers only (no tool advertising) — the agent runs tool
-    /// turns non-streamed and only streams the final reply. `on_delta` keeps this
-    /// free of any Tauri dependency; the command layer adapts a Channel to it.
-    pub async fn complete_stream<F>(
+    /// `on_delta` keeps this free of any Tauri dependency; the command layer
+    /// adapts a Channel to it. Tool-call turns emit little/no text, so `on_delta`
+    /// fires mainly during the final text answer.
+    pub async fn complete_stream_with_tools<F>(
         &self,
         base_url: &str,
         api_key: &str,
         model: &str,
         messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
         mut on_delta: F,
-    ) -> Result<String, String>
+    ) -> Result<Completion, String>
     where
         F: FnMut(&str),
     {
@@ -261,8 +362,8 @@ impl AiService {
             messages,
             temperature: 0.7,
             max_tokens: 8192,
-            tools: None,
-            tool_choice: None,
+            tools,
+            tool_choice: tools.map(|_| "auto"),
             stream: true,
         };
 
@@ -283,7 +384,7 @@ impl AiService {
 
         let mut stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut full = String::new();
+        let mut acc = StreamAccumulator::default();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("Stream error: {}", e))?;
@@ -295,11 +396,12 @@ impl AiService {
                 let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line_bytes);
                 match parse_sse_line(&line) {
-                    StreamEvent::Delta(t) => {
-                        on_delta(&t);
-                        full.push_str(&t);
+                    StreamEvent::Delta(d) => {
+                        if let Some(frag) = acc.apply(d) {
+                            on_delta(&frag);
+                        }
                     }
-                    StreamEvent::Done => return Ok(full),
+                    StreamEvent::Done => return Ok(acc.into_completion()),
                     StreamEvent::Skip => {}
                 }
             }
@@ -308,13 +410,14 @@ impl AiService {
         // Flush any trailing line without a final newline.
         if !buf.is_empty() {
             let line = String::from_utf8_lossy(&buf);
-            if let StreamEvent::Delta(t) = parse_sse_line(&line) {
-                on_delta(&t);
-                full.push_str(&t);
+            if let StreamEvent::Delta(d) = parse_sse_line(&line) {
+                if let Some(frag) = acc.apply(d) {
+                    on_delta(&frag);
+                }
             }
         }
 
-        Ok(full)
+        Ok(acc.into_completion())
     }
 
     /// Compute embeddings for `inputs` via the OpenAI-compatible `/embeddings`
@@ -478,10 +581,17 @@ mod tests {
         assert!(extract_completion(resp).is_err());
     }
 
+    fn content_delta(text: &str) -> StreamEvent {
+        StreamEvent::Delta(ParsedDelta {
+            content: Some(text.to_string()),
+            tool_calls: vec![],
+        })
+    }
+
     #[test]
     fn sse_content_delta_is_parsed() {
         let line = r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#;
-        assert_eq!(parse_sse_line(line), StreamEvent::Delta("你好".to_string()));
+        assert_eq!(parse_sse_line(line), content_delta("你好"));
     }
 
     #[test]
@@ -516,7 +626,93 @@ mod tests {
     #[test]
     fn sse_handles_crlf_line_ending() {
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n";
-        assert_eq!(parse_sse_line(line), StreamEvent::Delta("x".to_string()));
+        assert_eq!(parse_sse_line(line), content_delta("x"));
+    }
+
+    #[test]
+    fn sse_tool_call_delta_is_parsed() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","function":{"name":"fetch_subscription","arguments":"{\"u"}}
+        ]}}]}"#;
+        match parse_sse_line(line) {
+            StreamEvent::Delta(d) => {
+                assert!(d.content.is_none());
+                assert_eq!(d.tool_calls.len(), 1);
+                assert_eq!(d.tool_calls[0].index, 0);
+                assert_eq!(d.tool_calls[0].name.as_deref(), Some("fetch_subscription"));
+                assert_eq!(d.tool_calls[0].arguments.as_deref(), Some("{\"u"));
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accumulator_assembles_text() {
+        let mut acc = StreamAccumulator::default();
+        assert_eq!(
+            acc.apply(ParsedDelta {
+                content: Some("Hel".into()),
+                tool_calls: vec![]
+            }),
+            Some("Hel".to_string())
+        );
+        assert_eq!(
+            acc.apply(ParsedDelta {
+                content: Some("lo".into()),
+                tool_calls: vec![]
+            }),
+            Some("lo".to_string())
+        );
+        let c = acc.into_completion();
+        assert_eq!(c.content, "Hello");
+        assert!(!c.has_tool_calls());
+    }
+
+    #[test]
+    fn accumulator_reassembles_tool_call_from_fragments() {
+        let mut acc = StreamAccumulator::default();
+        // id + name arrive first, then arguments in pieces.
+        acc.apply(ParsedDelta {
+            content: None,
+            tool_calls: vec![ToolCallDelta {
+                index: 0,
+                id: Some("call_9".into()),
+                name: Some("fetch_subscription".into()),
+                arguments: Some("{\"url\":".into()),
+            }],
+        });
+        acc.apply(ParsedDelta {
+            content: None,
+            tool_calls: vec![ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments: Some("\"https://x.com\"}".into()),
+            }],
+        });
+        let c = acc.into_completion();
+        assert_eq!(c.content, "");
+        let calls = c.tool_calls.expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_9");
+        assert_eq!(calls[0].function.name, "fetch_subscription");
+        assert_eq!(calls[0].function.arguments, r#"{"url":"https://x.com"}"#);
+    }
+
+    #[test]
+    fn accumulator_handles_multiple_tool_calls_by_index() {
+        let mut acc = StreamAccumulator::default();
+        acc.apply(ParsedDelta {
+            content: None,
+            tool_calls: vec![
+                ToolCallDelta { index: 0, id: Some("a".into()), name: Some("subconverter_status".into()), arguments: Some("{}".into()) },
+                ToolCallDelta { index: 1, id: Some("b".into()), name: Some("fetch_subscription".into()), arguments: Some("{\"url\":\"x\"}".into()) },
+            ],
+        });
+        let calls = acc.into_completion().tool_calls.expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "subconverter_status");
+        assert_eq!(calls[1].function.name, "fetch_subscription");
     }
 
     #[test]

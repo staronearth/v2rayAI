@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use sub_converter::SubConverterManager;
 use sys_proxy::{disable_system_proxy, enable_system_proxy, ProxySettings};
+use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -291,6 +292,7 @@ async fn chat_with_ai(
     history: Vec<ChatMessage>,
     settings: AiSettings,
     context: Option<ConnectionContext>,
+    on_event: Channel<String>,
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
     // ── If an embedding model is configured, compute the query vector so the
@@ -326,6 +328,11 @@ async fn chat_with_ai(
     thread.push(ChatMessage::user(message));
 
     // ── Run agentic loop ──────────────────────────────────────────────────────
+    // Forward each streamed text fragment to the frontend over the channel.
+    let on_delta = |delta: &str| {
+        let _ = on_event.send(delta.to_string());
+    };
+
     agent::run(
         &state.ai_service,
         &settings.base_url,
@@ -333,6 +340,7 @@ async fn chat_with_ai(
         &settings.model,
         thread,
         &state.sub_converter,
+        on_delta,
     )
     .await
 }
