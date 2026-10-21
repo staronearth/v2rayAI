@@ -217,9 +217,10 @@ impl ServerConfig {
                 if let Some(fp) = non_empty_option(self.fingerprint.as_deref()) {
                     tls.insert("fingerprint".into(), Value::String(fp.to_string()));
                 }
-                if self.allow_insecure == Some(true) {
-                    tls.insert("allowInsecure".into(), Value::Bool(true));
-                }
+                // NOTE: `allowInsecure` was removed in Xray 26.x (migrated to
+                // `pinnedPeerCertSha256`). Emitting it now fails config load, so
+                // we no longer output it — the parsed flag is kept only for the
+                // env snapshot / UI display.
                 stream.insert("tlsSettings".into(), Value::Object(tls));
             }
             "reality" => {
@@ -785,12 +786,14 @@ mod tests {
         let link =
             "trojan://my-password@trojan.example.com:443?security=tls&allowInsecure=1#Trojan节点";
         let node = parse_share_link(link).unwrap();
+        // Parsing still records the flag (used for UI / env snapshot)…
         assert_eq!(node.allow_insecure, Some(true));
 
+        // …but the generated config must NOT contain `allowInsecure`, which was
+        // removed in Xray 26.x and causes config load to fail.
         let config = node.to_v2ray_config(10808, 10809, "global");
-        assert_eq!(
-            config["outbounds"][0]["streamSettings"]["tlsSettings"]["allowInsecure"],
-            true
+        assert!(
+            config["outbounds"][0]["streamSettings"]["tlsSettings"]["allowInsecure"].is_null()
         );
     }
 

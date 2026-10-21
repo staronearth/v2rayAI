@@ -64,7 +64,26 @@ pub async fn test_tcp_latency(host: &str, port: u16, timeout_secs: u64) -> Laten
     }
 }
 
-/// Test HTTP latency through the local proxy (real-world check)
+/// HTTP 204 connectivity probes, tried in order until one succeeds.
+/// Cloudflare comes first: it is not part of Google's network, so it still
+/// works on nodes that block Google. The gstatic endpoints are fallbacks.
+const PROBE_URLS: &[&str] = &[
+    "http://cp.cloudflare.com/generate_204",
+    "http://www.gstatic.com/generate_204",
+    "http://connectivitycheck.gstatic.com/generate_204",
+];
+
+/// Whether a probe HTTP status counts as a successful 204 connectivity check.
+fn is_probe_ok(status: u16) -> bool {
+    status == 204
+}
+
+/// Test HTTP latency through the local proxy (real-world check).
+///
+/// Tries multiple 204 probe endpoints in order, returning on the first that
+/// answers 204. Using several targets avoids false failures when a single
+/// probe host is blocked or hijacked by the node's exit (e.g. Google-blocked
+/// nodes still pass via Cloudflare).
 pub async fn test_via_proxy(http_proxy_port: u16, timeout_secs: u64) -> LatencyResult {
     let proxy = format!("http://127.0.0.1:{}", http_proxy_port);
 
@@ -84,36 +103,34 @@ pub async fn test_via_proxy(http_proxy_port: u16, timeout_secs: u64) -> LatencyR
         }
     };
 
-    let start = Instant::now();
-    match client
-        .get("http://www.gstatic.com/generate_204")
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let ms = start.elapsed().as_millis() as u64;
-            if resp.status().as_u16() == 204 {
-                LatencyResult {
-                    tcp_ms: None,
-                    http_ms: Some(ms),
-                    reachable: true,
-                    error: None,
+    let mut last_error = String::from("无可用探测目标");
+    for url in PROBE_URLS {
+        let start = Instant::now();
+        match client.get(*url).send().await {
+            Ok(resp) => {
+                let ms = start.elapsed().as_millis() as u64;
+                let status = resp.status().as_u16();
+                if is_probe_ok(status) {
+                    return LatencyResult {
+                        tcp_ms: None,
+                        http_ms: Some(ms),
+                        reachable: true,
+                        error: None,
+                    };
                 }
-            } else {
-                LatencyResult {
-                    tcp_ms: None,
-                    http_ms: Some(ms),
-                    reachable: false,
-                    error: Some(format!("HTTP {}", resp.status())),
-                }
+                last_error = format!("HTTP {}", status);
+            }
+            Err(e) => {
+                last_error = format!("代理请求失败：{}", e);
             }
         }
-        Err(e) => LatencyResult {
-            tcp_ms: None,
-            http_ms: None,
-            reachable: false,
-            error: Some(format!("代理请求失败：{}", e)),
-        },
+    }
+
+    LatencyResult {
+        tcp_ms: None,
+        http_ms: None,
+        reachable: false,
+        error: Some(last_error),
     }
 }
 
@@ -218,5 +235,28 @@ impl HealthMonitor {
     /// Subscribe to health events
     pub fn subscribe(&self) -> broadcast::Receiver<HealthEvent> {
         self.tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_ok_only_for_204() {
+        assert!(is_probe_ok(204));
+        assert!(!is_probe_ok(200));
+        assert!(!is_probe_ok(403));
+        assert!(!is_probe_ok(0));
+    }
+
+    #[test]
+    fn probe_urls_are_204_endpoints_with_cloudflare_first() {
+        assert!(!PROBE_URLS.is_empty());
+        // Cloudflare must be first so Google-blocked nodes still pass.
+        assert!(PROBE_URLS[0].contains("cloudflare"));
+        for url in PROBE_URLS {
+            assert!(url.ends_with("/generate_204"), "non-204 probe: {url}");
+        }
     }
 }

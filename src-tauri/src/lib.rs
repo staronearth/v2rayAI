@@ -11,6 +11,7 @@ mod secure_store;
 mod sub_converter;
 mod sys_proxy;
 mod traffic_monitor;
+mod types;
 
 use agent::AgentResult;
 use ai_service::{AiService, ChatMessage};
@@ -18,7 +19,7 @@ use app_logger::LogEntry;
 use chat_history::{
     auto_title, delete_conversation, format_history_rag_context, list_conversations,
     load_conversation, save_conversation, search_conversations, search_history_rag, Conversation,
-    ConversationMeta,
+    ConversationMeta, HistoryCache,
 };
 use config_generator::{parse_share_link, parse_subscription, ServerConfig};
 use config_manager::{ConfigManager, SavedConfig};
@@ -32,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use sub_converter::SubConverterManager;
 use sys_proxy::{disable_system_proxy, enable_system_proxy, ProxySettings};
+use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -44,6 +46,7 @@ pub struct AppState {
     pub health_monitor: HealthMonitor,
     pub knowledge_base: Arc<Mutex<KnowledgeBase>>,
     pub sub_converter: Arc<SubConverterManager>,
+    pub history_cache: Arc<Mutex<HistoryCache>>,
 }
 
 // ── App Logger ────────────────────────────────────────────────────────────────
@@ -116,7 +119,7 @@ fn generate_conv_title(messages: Vec<ChatMessage>) -> String {
     let hist_msgs: Vec<chat_history::ChatMessage> = messages
         .iter()
         .map(|m| chat_history::ChatMessage {
-            role: m.role.clone(),
+            role: m.role.as_str().to_string(),
             content: m.content.clone(),
             timestamp: 0,
         })
@@ -131,6 +134,9 @@ pub struct AiSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Optional embedding model; when set, enables vector RAG retrieval.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -286,15 +292,28 @@ async fn chat_with_ai(
     history: Vec<ChatMessage>,
     settings: AiSettings,
     context: Option<ConnectionContext>,
+    on_event: Channel<String>,
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
+    // ── If an embedding model is configured, compute the query vector so the
+    //    document RAG can use vector search (falls back to keywords on error). ──
+    let query_embedding = match settings.embedding_model.as_deref().filter(|m| !m.is_empty()) {
+        Some(em) => state
+            .ai_service
+            .embeddings(&settings.base_url, &settings.api_key, em, &[message.clone()])
+            .await
+            .ok()
+            .and_then(|mut v| v.pop()),
+        None => None,
+    };
+
     // ── Dual RAG: document search + history search (concurrent) ──────────────
     let (doc_rag, hist_chunks) = tokio::join!(
         async {
             let kb = state.knowledge_base.lock().await;
-            kb.get_rag_context(&message, 4)
+            kb.get_rag_context(&message, 4, query_embedding.as_deref())
         },
-        search_history_rag(&message, 3, 600),
+        search_history_rag(&state.history_cache, &message, 3, 600),
     );
     let hist_rag = format_history_rag_context(&hist_chunks);
 
@@ -304,17 +323,16 @@ async fn chat_with_ai(
     // ── Assemble the full message thread ─────────────────────────────────────
     // [system] → [history turns] → [current user message]
     let mut thread = Vec::with_capacity(history.len() + 2);
-    thread.push(ChatMessage {
-        role: "system".to_string(),
-        content: system_content,
-    });
+    thread.push(ChatMessage::system(system_content));
     thread.extend(history);
-    thread.push(ChatMessage {
-        role: "user".to_string(),
-        content: message,
-    });
+    thread.push(ChatMessage::user(message));
 
     // ── Run agentic loop ──────────────────────────────────────────────────────
+    // Forward each streamed text fragment to the frontend over the channel.
+    let on_delta = |delta: &str| {
+        let _ = on_event.send(delta.to_string());
+    };
+
     agent::run(
         &state.ai_service,
         &settings.base_url,
@@ -322,6 +340,7 @@ async fn chat_with_ai(
         &settings.model,
         thread,
         &state.sub_converter,
+        on_delta,
     )
     .await
 }
@@ -340,8 +359,9 @@ pub struct HistoryRagResult {
 async fn search_history_knowledge(
     query: String,
     top_k: Option<usize>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<HistoryRagResult>, String> {
-    let chunks = search_history_rag(&query, top_k.unwrap_or(5), 600).await;
+    let chunks = search_history_rag(&state.history_cache, &query, top_k.unwrap_or(5), 600).await;
     Ok(chunks
         .into_iter()
         .map(|c| HistoryRagResult {
@@ -365,6 +385,23 @@ async fn refresh_knowledge_base(
     kb.xray_version = xray_version;
     kb.save().await?;
     Ok(kb.chunks.len())
+}
+
+/// Compute and cache embeddings for every knowledge-base chunk, enabling vector
+/// RAG retrieval. Requires `embedding_model` to be set in the AI settings.
+#[tauri::command]
+async fn embed_knowledge_base(
+    settings: AiSettings,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let model = settings
+        .embedding_model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .ok_or("未配置 embedding 模型")?;
+    let mut kb = state.knowledge_base.lock().await;
+    kb.embed_chunks(&state.ai_service, &settings.base_url, &settings.api_key, model)
+        .await
 }
 
 #[tauri::command]
@@ -698,6 +735,7 @@ pub fn run() {
         health_monitor: HealthMonitor::new(),
         knowledge_base: Arc::new(Mutex::new(kb)),
         sub_converter: Arc::new(SubConverterManager::new()),
+        history_cache: Arc::new(Mutex::new(HistoryCache::default())),
     };
 
     tauri::Builder::default()
@@ -722,6 +760,7 @@ pub fn run() {
             chat_with_ai,
             search_history_knowledge,
             refresh_knowledge_base,
+            embed_knowledge_base,
             search_knowledge,
             parse_proxy_link,
             parse_subscription_content,

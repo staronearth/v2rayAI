@@ -134,9 +134,19 @@ impl KnowledgeBase {
             .collect()
     }
 
-    /// Format top-k chunks as context string for AI prompt
-    pub fn get_rag_context(&self, query: &str, top_k: usize) -> String {
-        let chunks = self.search(query, top_k);
+    /// Format top-k chunks as context string for AI prompt. Uses vector search
+    /// when a `query_embedding` is supplied and chunks carry embeddings; otherwise
+    /// falls back to keyword TF-IDF.
+    pub fn get_rag_context(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_embedding: Option<&[f32]>,
+    ) -> String {
+        let chunks = match query_embedding {
+            Some(q) if self.has_embeddings() => self.search_vector(q, top_k),
+            _ => self.search(query, top_k),
+        };
         if chunks.is_empty() {
             return String::new();
         }
@@ -151,14 +161,131 @@ impl KnowledgeBase {
         ctx.push_str("---\n");
         ctx
     }
+
+    /// True if any chunk has a precomputed embedding.
+    pub fn has_embeddings(&self) -> bool {
+        self.chunks.iter().any(|c| c.embedding.is_some())
+    }
+
+    /// Rank chunks that have embeddings by cosine similarity to `query`.
+    fn search_vector(&self, query: &[f32], top_k: usize) -> Vec<&DocChunk> {
+        let mut scored: Vec<(&DocChunk, f32)> = self
+            .chunks
+            .iter()
+            .filter_map(|c| c.embedding.as_ref().map(|e| (c, cosine_similarity(query, e))))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(top_k).map(|(c, _)| c).collect()
+    }
+
+    /// Compute and store an embedding for every chunk via the embedding API, then
+    /// persist. Enables vector search on subsequent queries.
+    pub async fn embed_chunks(
+        &mut self,
+        ai: &crate::ai_service::AiService,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Result<usize, String> {
+        let inputs: Vec<String> = self
+            .chunks
+            .iter()
+            .map(|c| format!("{}\n{}", c.title, c.content))
+            .collect();
+        let vectors = ai.embeddings(base_url, api_key, model, &inputs).await?;
+        if vectors.len() != self.chunks.len() {
+            return Err(format!(
+                "embedding 数量({})与文档块数量({})不匹配",
+                vectors.len(),
+                self.chunks.len()
+            ));
+        }
+        for (chunk, v) in self.chunks.iter_mut().zip(vectors) {
+            chunk.embedding = Some(v);
+        }
+        self.save().await?;
+        Ok(self.chunks.len())
+    }
 }
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| w.len() > 1)
-        .map(|w| w.to_string())
-        .collect()
+/// Cosine similarity of two equal-length vectors. Returns 0.0 for
+/// mismatched-length, empty, or zero-magnitude inputs.
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Tokenize a query/text for keyword matching. Shared by document and history RAG.
+///
+/// ASCII alphanumeric words are kept whole (lowercased, length > 1). Runs of CJK
+/// characters are split into overlapping bigrams so that *unspaced* Chinese — the
+/// common case — still yields matchable tokens; a lone CJK char is emitted as-is.
+/// Without this, `is_alphanumeric()` treats a whole Chinese phrase as one token
+/// that almost never `contains`-matches, so Chinese retrieval silently failed.
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut ascii = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+
+    for c in lower.chars() {
+        if is_cjk(c) {
+            flush_ascii(&mut ascii, &mut tokens);
+            cjk.push(c);
+        } else if c.is_alphanumeric() || c == '_' || c == '-' {
+            flush_cjk(&mut cjk, &mut tokens);
+            ascii.push(c);
+        } else {
+            flush_ascii(&mut ascii, &mut tokens);
+            flush_cjk(&mut cjk, &mut tokens);
+        }
+    }
+    flush_ascii(&mut ascii, &mut tokens);
+    flush_cjk(&mut cjk, &mut tokens);
+    tokens
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4dbf}'   // CJK Extension A
+        | '\u{4e00}'..='\u{9fff}' // CJK Unified Ideographs
+        | '\u{f900}'..='\u{faff}' // CJK Compatibility Ideographs
+    )
+}
+
+/// Flush a buffered ASCII word — kept only if longer than one character.
+fn flush_ascii(ascii: &mut String, tokens: &mut Vec<String>) {
+    if ascii.chars().count() > 1 {
+        tokens.push(ascii.clone());
+    }
+    ascii.clear();
+}
+
+/// Flush a buffered CJK run as overlapping bigrams (or a single char if len 1).
+fn flush_cjk(cjk: &mut Vec<char>, tokens: &mut Vec<String>) {
+    match cjk.len() {
+        0 => {}
+        1 => tokens.push(cjk[0].to_string()),
+        _ => {
+            for w in cjk.windows(2) {
+                tokens.push(w.iter().collect());
+            }
+        }
+    }
+    cjk.clear();
 }
 
 fn score_chunk(chunk: &DocChunk, query_terms: &[String]) -> f32 {
@@ -726,4 +853,122 @@ openssl rand -hex 8
 ```"#.into(),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_lowercases_ascii_words() {
+        assert_eq!(tokenize("VLESS Reality"), vec!["vless", "reality"]);
+    }
+
+    #[test]
+    fn tokenize_drops_single_ascii_chars() {
+        // Length-1 ASCII tokens are noise and dropped (preserves prior behavior).
+        assert_eq!(tokenize("a bc d"), vec!["bc"]);
+    }
+
+    #[test]
+    fn tokenize_unspaced_chinese_into_bigrams() {
+        assert_eq!(tokenize("怎么配置"), vec!["怎么", "么配", "配置"]);
+    }
+
+    #[test]
+    fn tokenize_mixed_chinese_and_ascii() {
+        assert_eq!(tokenize("vless怎么配"), vec!["vless", "怎么", "么配"]);
+    }
+
+    #[test]
+    fn tokenize_single_cjk_char_kept() {
+        assert_eq!(tokenize("好"), vec!["好"]);
+    }
+
+    #[test]
+    fn tokenize_empty_input() {
+        assert!(tokenize("   ,.! ").is_empty());
+    }
+
+    #[test]
+    fn chinese_query_now_scores_against_chinese_chunk() {
+        // Regression: before bigram tokenization this scored 0.
+        let chunk = DocChunk {
+            id: "t".into(),
+            source: "test".into(),
+            title: "测试".into(),
+            content: "如何配置 VLESS 节点的 REALITY 参数".into(),
+            keywords: vec![],
+            embedding: None,
+        };
+        let terms = tokenize("配置节点");
+        assert!(score_chunk(&chunk, &terms) > 0.0);
+    }
+
+    #[test]
+    fn search_finds_chinese_query() {
+        let kb = KnowledgeBase {
+            xray_version: "test".into(),
+            built_at: 0,
+            chunks: get_builtin_chunks(),
+        };
+        let hits = kb.search("如何配置 reality", 3);
+        assert!(!hits.is_empty());
+    }
+
+    // ── Embedding / vector search ───────────────────────────────────────────
+
+    #[test]
+    fn cosine_identical_vectors_is_one() {
+        let v = [1.0, 2.0, 3.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_is_zero() {
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_guards_mismatched_empty_and_zero() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn vector_search_ranks_by_cosine() {
+        let mk = |id: &str, emb: Vec<f32>| DocChunk {
+            id: id.into(),
+            source: "s".into(),
+            title: "t".into(),
+            content: "c".into(),
+            keywords: vec![],
+            embedding: Some(emb),
+        };
+        let kb = KnowledgeBase {
+            xray_version: "t".into(),
+            built_at: 0,
+            chunks: vec![
+                mk("a", vec![1.0, 0.0]),
+                mk("b", vec![0.0, 1.0]),
+                mk("c", vec![0.9, 0.1]),
+            ],
+        };
+        let hits = kb.search_vector(&[1.0, 0.0], 2);
+        assert_eq!(hits[0].id, "a");
+        assert_eq!(hits[1].id, "c");
+    }
+
+    #[test]
+    fn rag_context_falls_back_to_keywords_without_embedding() {
+        let kb = KnowledgeBase {
+            xray_version: "t".into(),
+            built_at: 0,
+            chunks: get_builtin_chunks(),
+        };
+        // No query embedding (and builtin chunks have none) → keyword path.
+        let ctx = kb.get_rag_context("reality", 2, None);
+        assert!(ctx.contains("RAG"));
+    }
 }
